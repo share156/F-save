@@ -4,7 +4,7 @@ from pyrogram.errors import (
     UserAlreadyParticipant, InviteHashExpired, FloodWait,
     PeerIdInvalid, SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired,
     ChannelPrivate, UserNotParticipant, ChatForbidden,
-    RPCError   # new base class for all Telegram API errors
+    RPCError
 )
 from pyrogram.types import Message
 
@@ -77,19 +77,72 @@ async def get_user_client(uid, user_data):
     RUNNING_CLIENTS[uid] = client
     return client
 
-# --------------- Throttled Progress Callback ---------------
-async def progress_cb(current, total, status_message, action_text, last_update_ref):
+# --------------- Helper Formatter Utilities ---------------
+def get_readable_size(bytes_count):
+    """Converts a raw integer of bytes into a human-readable metric string."""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes_count < 1024.0:
+            return f"{bytes_count:.2f} {unit}"
+        bytes_count /= 1024.0
+    return f"{bytes_count:.2f} PB"
+
+def get_readable_time(seconds):
+    """Converts seconds into an intuitive duration string."""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    minutes = seconds / 60
+    if minutes < 60:
+        return f"{int(minutes)}m {int(seconds % 60)}s"
+    hours = minutes / 60
+    return f"{int(hours)}h {int(minutes % 60)}m"
+
+# --------------- Dynamic Visual Progress Callback ---------------
+async def progress_cb(current, total, status_message, action_text, tracking_ctx):
+    """
+    Calculates detailed real-time performance analytics:
+    Speed, human sizes, progress percentages, and structural ETA.
+    tracking_ctx is expected to be a dict: {"start_time": float, "last_edit": float}
+    """
     if not total:
         return
-    percent = current * 100 / total
+        
     now = time.time()
-    # Edit at most every 3 seconds to strictly avoid Telegram FloodWait rate limits
-    if now - last_update_ref[0] >= 3.0 or current == total:
-        last_update_ref[0] = now
+    # Edit at most every 3.5 seconds to protect account from strict TG Flood limit safety rules
+    if now - tracking_ctx.get("last_edit", 0.0) >= 3.5 or current == total:
+        tracking_ctx["last_edit"] = now
+        
+        # Performance Analytics Calculations
+        elapsed_time = now - tracking_ctx["start_time"]
+        if elapsed_time <= 0:
+            elapsed_time = 0.01
+            
+        speed_bps = current / elapsed_time
+        percent = current * 100 / total
+        
+        # Calculate Time Remaining (ETA)
+        bytes_remaining = total - current
+        eta_seconds = bytes_remaining / speed_bps if speed_bps > 0 else 0
+        
+        # String Conversions
+        readable_current = get_readable_size(current)
+        readable_total = get_readable_size(total)
+        readable_speed = f"{get_readable_size(speed_bps)}/s"
+        readable_eta = get_readable_time(eta_seconds) if current < total else "0s"
+        
+        # Build Visual Block Components
         filled = int(20 * percent / 100)
         bar = f"[{'█' * filled}{'░' * (20 - filled)}] {percent:.1f}%"
+        
+        metrics_panel = (
+            f"**{action_text}**\n\n"
+            f"📊 {bar}\n"
+            f"📁 **Size:** {readable_current} / {readable_total}\n"
+            f"⚡ **Speed:** {readable_speed}\n"
+            f"⏳ **ETA:** {readable_eta}"
+        )
+        
         try:
-            await status_message.edit_text(f"{action_text}\n\n{bar}")
+            await status_message.edit_text(metrics_panel)
         except Exception:
             pass
 
@@ -439,14 +492,17 @@ async def process_single_link(link, original_msg, current=0, total=0):
 
             # --- Processing Downloader Visualizations ---
             status_msg = await reply("⬇️ Connecting to target user server storage files...")
-            last_update_ref = [0.0]
+            
+            # Setup dedicated operational dictionaries for performance contexts
+            download_ctx = {"start_time": time.time(), "last_edit": 0.0}
+            upload_ctx = {"start_time": time.time(), "last_edit": 0.0}
 
             try:
                 # Download media cleanly with native async callback updates
                 file = await user_acc.download_media(
                     msg, 
                     progress=progress_cb, 
-                    progress_args=(status_msg, f"⬇️ Downloading message {current}/{total}", last_update_ref)
+                    progress_args=(status_msg, f"📥 Downloading message {current}/{total}", download_ctx)
                 )
 
                 thumb = None
@@ -460,18 +516,20 @@ async def process_single_link(link, original_msg, current=0, total=0):
                     try: thumb = await user_acc.download_media(msg.audio.thumbs[0].file_id)
                     except: pass
 
-                last_update_ref = [0.0]
+                # Reset upload timer reference point explicitly right before uploading starts
+                upload_ctx["start_time"] = time.time()
+                
                 if msg.document:
                     await bot.send_document(original_msg.chat.id, file, thumb=thumb,
                                       caption=msg.caption, caption_entities=msg.caption_entities,
                                       reply_to_message_id=original_msg.id, progress=progress_cb,
-                                      progress_args=(status_msg, f"⬆️ Uploading message {current}/{total}", last_update_ref))
+                                      progress_args=(status_msg, f"📤 Uploading message {current}/{total}", upload_ctx))
                 elif msg.video:
                     await bot.send_video(original_msg.chat.id, file, duration=msg.video.duration,
                                    width=msg.video.width, height=msg.video.height, thumb=thumb,
                                    caption=msg.caption, caption_entities=msg.caption_entities,
                                    reply_to_message_id=original_msg.id, progress=progress_cb,
-                                   progress_args=(status_msg, f"⬆️ Uploading message {current}/{total}", last_update_ref))
+                                   progress_args=(status_msg, f"📤 Uploading message {current}/{total}", upload_ctx))
                 elif msg.animation:
                     await bot.send_animation(original_msg.chat.id, file, reply_to_message_id=original_msg.id)
                 elif msg.sticker:
@@ -543,3 +601,4 @@ async def process_single_link(link, original_msg, current=0, total=0):
 
 # --------------- Start Application Execution ---------------
 bot.run()
+
