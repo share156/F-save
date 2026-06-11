@@ -25,6 +25,9 @@ USER_SESSIONS = {}
 USER_STATES = {}     # Tracks login conversation states: user_id -> string
 ACTIVE_LOGINS = {}   # Tracks temporary setup clients: user_id -> data dict
 
+# Global live client instances to maintain peer cache & fast connections
+RUNNING_CLIENTS = {} # user_id -> active Client instance
+
 def load_sessions():
     global USER_SESSIONS
     if os.path.exists(SESSION_FILE):
@@ -44,6 +47,33 @@ def save_sessions():
 
 # Load active storage databases at startup
 load_sessions()
+
+# --------------- Userbot Client Persistence Helper ---------------
+async def get_user_client(uid, user_data):
+    """Retrieves an existing running client or instantiates a reusable one to preserve peer cache."""
+    if uid in RUNNING_CLIENTS:
+        client = RUNNING_CLIENTS[uid]
+        if client.is_connected:
+            return client
+        try:
+            await client.start()
+            return client
+        except Exception:
+            try: await client.stop()
+            except: pass
+            RUNNING_CLIENTS.pop(uid, None)
+
+    # Spawn fresh in-memory persistent runner instance
+    client = Client(
+        name=f"run_{uid}",
+        api_id=user_data["api_id"],
+        api_hash=user_data["api_hash"],
+        session_string=user_data["session_string"],
+        in_memory=True
+    )
+    await client.start()
+    RUNNING_CLIENTS[uid] = client
+    return client
 
 # --------------- Throttled Progress Callback ---------------
 async def progress_cb(current, total, status_message, action_text, last_update_ref):
@@ -97,7 +127,15 @@ async def cancel_login(bot: Client, m: Message):
 
 @bot.on_message(filters.command(["logout"]) & filters.private)
 async def logout_user(bot: Client, m: Message):
-    str_uid = str(m.from_user.id)
+    uid = m.from_user.id
+    str_uid = str(uid)
+    
+    # Cleanly stop any active persistent background sessions
+    if uid in RUNNING_CLIENTS:
+        try: await RUNNING_CLIENTS[uid].stop()
+        except: pass
+        RUNNING_CLIENTS.pop(uid, None)
+
     if str_uid in USER_SESSIONS:
         USER_SESSIONS.pop(str_uid, None)
         save_sessions()
@@ -245,11 +283,9 @@ async def handle_text_inputs(client: Client, message: Message):
             return
         
         user_data = USER_SESSIONS[str_uid]
-        user_acc = Client(f"run_{uid}", api_id=user_data["api_id"], api_hash=user_data["api_hash"], session_string=user_data["session_string"], in_memory=True)
         try:
-            await user_acc.start()
+            user_acc = await get_user_client(uid, user_data)
             await user_acc.join_chat(text)
-            await user_acc.stop()
             await bot.send_message(message.chat.id, "**Successfully joined private chat via your account!**", reply_to_message_id=message.id)
         except UserAlreadyParticipant:
             await bot.send_message(message.chat.id, "**Already a member of this chat group.**", reply_to_message_id=message.id)
@@ -311,39 +347,63 @@ async def process_single_link(link, original_msg, current=0, total=0):
             chatid = int("-100" + datas[-2])
             user_data = USER_SESSIONS[str_uid]
             
-            user_acc = Client(
-                name=f"run_{uid}",
-                api_id=user_data["api_id"],
-                api_hash=user_data["api_hash"],
-                session_string=user_data["session_string"],
-                in_memory=True
-            )
+            try:
+                user_acc = await get_user_client(uid, user_data)
+            except Exception as e:
+                await reply(f"❌ Failed to fetch user runner session connection: `{e}`")
+                return
             
             try:
-                await user_acc.start()
-                try:
-                    await user_acc.get_chat(chatid)
-                except PeerIdInvalid:
-                    await reply("❌ **Your logged in userbot account is not a member of this private chat group.**\nPlease join the chat first using your profile link.")
-                    await user_acc.stop()
-                    return
-
+                # Attempt to directly gather the message item
                 msg = await user_acc.get_messages(chatid, msgid)
                 
+                # Proactive Self-Healing Routine if Peer Hash is completely unknown to RAM
                 if msg is None:
-                    await reply(f"❌ Target item data was missing or not found: {link}")
-                    await user_acc.stop()
+                    raise PeerIdInvalid
+
+            except PeerIdInvalid:
+                # If cache is empty, dynamically force-load dialogue listings to populate hashes
+                status_msg_peer = await reply("🔍 Resolving chat authorization access hashes (first-time setup)...")
+                found = False
+                try:
+                    async for dialog in user_acc.get_dialogs():
+                        if dialog.chat.id == chatid:
+                            found = True
+                            break
+                except Exception as d_err:
+                    await status_msg_peer.edit_text(f"⚠️ Failed parsing account dialog directory: `{d_err}`")
                     return
+                
+                try: await status_msg_peer.delete()
+                except: pass
 
-                if msg.text and not msg.media:
-                    await reply(msg.text)
-                    await user_acc.stop()
-                    return 
+                if found:
+                    try:
+                        msg = await user_acc.get_messages(chatid, msgid)
+                    except Exception as retry_err:
+                        await reply(f"❌ Chat verified but message collection failed: `{retry_err}`")
+                        return
+                else:
+                    await reply("❌ **Your logged in userbot account is not a member of this private chat group.**\nPlease join the chat first using your profile link.")
+                    return
+            except Exception as e:
+                await reply(f"⚠️ Extraction block error on link: {link} – Trace: `{e}`")
+                return
 
-                # --- Processing Downloader Visualizations ---
-                status_msg = await reply("⬇️ Connecting to target user server storage files...")
-                last_update_ref = [0.0]
+            # Validate that the extracted package actually contains target assets
+            if msg is None:
+                await reply(f"❌ Target item data was missing or not found on server: {link}")
+                return
 
+            if msg.text and not msg.media:
+                await reply(msg.text)
+                break 
+
+            # --- Processing Downloader Visualizations ---
+            status_msg = await reply("⬇️ Connecting to target user server storage files...")
+            last_update_ref = [0.0]
+
+            try:
                 # Download media cleanly with native async callback updates
                 file = await user_acc.download_media(
                     msg, 
@@ -392,20 +452,14 @@ async def process_single_link(link, original_msg, current=0, total=0):
                 
                 try: await status_msg.delete()
                 except: pass
-
-                await user_acc.stop()
                 break 
 
             except FloodWait as e:
-                try: await user_acc.stop()
-                except: pass
                 await asyncio.sleep(e.value)
                 await reply(f"⚠️ Flood wait limits triggered – retrying same item index after waiting {e.value}s")
                 continue
             except Exception as e:
-                try: await user_acc.stop()
-                except: pass
-                await reply(f"⚠️ Extraction block error on link: {link} – Trace: `{e}`")
+                await reply(f"⚠️ Processing pipeline failed on link: {link} – Trace: `{e}`")
                 break
 
         # --- Route 2: Target Link Points to Public Chat Settings ---
