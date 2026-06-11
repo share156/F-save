@@ -139,148 +139,161 @@ def process_single_link(link, original_msg, current=0, total=0):
     def reply(text):
         bot.send_message(original_msg.chat.id, text, reply_to_message_id=original_msg.id)
 
-    # --- Private chat ---
-    if "https://t.me/c/" in link:
-        chatid = int("-100" + datas[-2])
-        try:
-            with acc:
-                try:
-                    acc.get_chat(chatid)
-                except PeerIdInvalid:
-                    reply("❌ **Your session account is not a member of this private chat.**\n"
-                          "Send the correct invite link first.")
+    # Wrap in a retry loop to prevent skipping on FloodWait
+    while True:
+        # --- Private chat ---
+        if "https://t.me/c/" in link:
+            chatid = int("-100" + datas[-2])
+            try:
+                with acc:
+                    try:
+                        acc.get_chat(chatid)
+                    except PeerIdInvalid:
+                        reply("❌ **Your session account is not a member of this private chat.**\n"
+                              "Send the correct invite link first.")
+                        return
+
+                    msg = acc.get_messages(chatid, msgid)
+                if msg is None:
+                    reply(f"❌ Message not found: {link}")
                     return
 
-                msg = acc.get_messages(chatid, msgid)
-            if msg is None:
-                reply(f"❌ Message not found: {link}")
-                return
+                if "text" in str(msg):
+                    reply(msg.text)
+                    return # Exit function entirely since text is simple
 
-            if "text" in str(msg):
-                reply(msg.text)
-                return
+                # --- Download & Upload with real‑time progress bar ---
+                sid = f"{original_msg.id}_{current}"
+                down_file = f"{sid}downstatus.txt"
+                up_file = f"{sid}upstatus.txt"
 
-            # --- Download & Upload with real‑time progress bar ---
-            sid = f"{original_msg.id}_{current}"
-            down_file = f"{sid}downstatus.txt"
-            up_file = f"{sid}upstatus.txt"
+                status_msg = reply("⬇️ Preparing download...")
+                tracker = threading.Thread(target=status_updater, args=(down_file, status_msg, f"{current}/{total}"), daemon=True)
+                tracker.start()
 
-            # Create a single status message that will be updated throughout
-            status_msg = reply("⬇️ Preparing download...")
-            tracker = threading.Thread(target=status_updater, args=(down_file, status_msg, f"{current}/{total}"), daemon=True)
-            tracker.start()
+                file = acc.download_media(msg, progress=make_progress_callback(down_file))
+                os.remove(down_file)
 
-            file = acc.download_media(msg, progress=make_progress_callback(down_file))
-            os.remove(down_file)
+                up_tracker = threading.Thread(target=status_updater, args=(up_file, status_msg, f"{current}/{total}"), daemon=True)
+                up_tracker.start()
 
-            # Switch to upload progress
-            up_tracker = threading.Thread(target=status_updater, args=(up_file, status_msg, f"{current}/{total}"), daemon=True)
-            up_tracker.start()
+                thumb = None
+                if "Document" in str(msg) and msg.document.thumbs:
+                    try:
+                        with acc:
+                            thumb = acc.download_media(msg.document.thumbs[0].file_id)
+                    except: pass
+                elif "Video" in str(msg) and msg.video.thumbs:
+                    try:
+                        with acc:
+                            thumb = acc.download_media(msg.video.thumbs[0].file_id)
+                    except: pass
+                elif "Audio" in str(msg) and msg.audio.thumbs:
+                    try:
+                        with acc:
+                            thumb = acc.download_media(msg.audio.thumbs[0].file_id)
+                    except: pass
 
-            thumb = None
-            if "Document" in str(msg) and msg.document.thumbs:
-                try:
-                    with acc:
-                        thumb = acc.download_media(msg.document.thumbs[0].file_id)
-                except: pass
-            elif "Video" in str(msg) and msg.video.thumbs:
-                try:
-                    with acc:
-                        thumb = acc.download_media(msg.video.thumbs[0].file_id)
-                except: pass
-            elif "Audio" in str(msg) and msg.audio.thumbs:
-                try:
-                    with acc:
-                        thumb = acc.download_media(msg.audio.thumbs[0].file_id)
-                except: pass
-
-            if "Document" in str(msg):
-                bot.send_document(original_msg.chat.id, file, thumb=thumb,
-                                  caption=msg.caption, caption_entities=msg.caption_entities,
-                                  reply_to_message_id=original_msg.id,
-                                  progress=make_progress_callback(up_file))
-            elif "Video" in str(msg):
-                bot.send_video(original_msg.chat.id, file, duration=msg.video.duration,
-                               width=msg.video.width, height=msg.video.height, thumb=thumb,
-                               caption=msg.caption, caption_entities=msg.caption_entities,
-                               reply_to_message_id=original_msg.id,
-                               progress=make_progress_callback(up_file))
-            elif "Animation" in str(msg):
-                bot.send_animation(original_msg.chat.id, file, reply_to_message_id=original_msg.id)
-            elif "Sticker" in str(msg):
-                bot.send_sticker(original_msg.chat.id, file, reply_to_message_id=original_msg.id)
-            elif "Voice" in str(msg):
-                bot.send_voice(original_msg.chat.id, file, caption=msg.caption,
-                               reply_to_message_id=original_msg.id)
-            elif "Audio" in str(msg):
-                bot.send_audio(original_msg.chat.id, file, caption=msg.caption,
-                               caption_entities=msg.caption_entities,
-                               reply_to_message_id=original_msg.id)
-            elif "Photo" in str(msg):
-                bot.send_photo(original_msg.chat.id, file, caption=msg.caption,
-                               caption_entities=msg.caption_entities,
-                               reply_to_message_id=original_msg.id)
-
-            # Cleanup
-            os.remove(file)
-            if os.path.exists(up_file):
-                os.remove(up_file)
-            try:
-                bot.delete_messages(original_msg.chat.id, [status_msg.id])
-            except:
-                pass
-
-        except FloodWait as e:
-            time.sleep(e.x)
-            reply(f"⚠️ Flood wait – retrying after {e.x}s")
-        except Exception as e:
-            reply(f"⚠️ Failed: {link} – {e}")
-
-    # --- Public chat ---
-    else:
-        username = datas[-2]
-        try:
-            msg = bot.get_messages(username, msgid)
-            if msg is None:
-                reply(f"❌ Message not found: {link}")
-                return
-
-            # Public chats use file IDs directly (no download progress needed)
-            if "Document" in str(msg):
-                bot.send_document(original_msg.chat.id, msg.document.file_id,
-                                  caption=msg.caption, caption_entities=msg.caption_entities,
-                                  reply_to_message_id=original_msg.id)
-            elif "Video" in str(msg):
-                bot.send_video(original_msg.chat.id, msg.video.file_id,
-                               caption=msg.caption, caption_entities=msg.caption_entities,
-                               reply_to_message_id=original_msg.id)
-            elif "Animation" in str(msg):
-                bot.send_animation(original_msg.chat.id, msg.animation.file_id,
+                if "Document" in str(msg):
+                    bot.send_document(original_msg.chat.id, file, thumb=thumb,
+                                      caption=msg.caption, caption_entities=msg.caption_entities,
+                                      reply_to_message_id=original_msg.id,
+                                      progress=make_progress_callback(up_file))
+                elif "Video" in str(msg):
+                    bot.send_video(original_msg.chat.id, file, duration=msg.video.duration,
+                                   width=msg.video.width, height=msg.video.height, thumb=thumb,
+                                   caption=msg.caption, caption_entities=msg.caption_entities,
+                                   reply_to_message_id=original_msg.id,
+                                   progress=make_progress_callback(up_file))
+                elif "Animation" in str(msg):
+                    bot.send_animation(original_msg.chat.id, file, reply_to_message_id=original_msg.id)
+                elif "Sticker" in str(msg):
+                    bot.send_sticker(original_msg.chat.id, file, reply_to_message_id=original_msg.id)
+                elif "Voice" in str(msg):
+                    bot.send_voice(original_msg.chat.id, file, caption=msg.caption,
                                    reply_to_message_id=original_msg.id)
-            elif "Sticker" in str(msg):
-                bot.send_sticker(original_msg.chat.id, msg.sticker.file_id,
-                                 reply_to_message_id=original_msg.id)
-            elif "Voice" in str(msg):
-                bot.send_voice(original_msg.chat.id, msg.voice.file_id,
-                               caption=msg.caption, caption_entities=msg.caption_entities,
-                               reply_to_message_id=original_msg.id)
-            elif "Audio" in str(msg):
-                bot.send_audio(original_msg.chat.id, msg.audio.file_id,
-                               caption=msg.caption, caption_entities=msg.caption_entities,
-                               reply_to_message_id=original_msg.id)
-            elif "text" in str(msg):
-                bot.send_message(original_msg.chat.id, msg.text, entities=msg.entities,
-                                 reply_to_message_id=original_msg.id)
-            elif "Photo" in str(msg):
-                bot.send_photo(original_msg.chat.id, msg.photo.file_id,
-                               caption=msg.caption, caption_entities=msg.caption_entities,
-                               reply_to_message_id=original_msg.id)
+                elif "Audio" in str(msg):
+                    bot.send_audio(original_msg.chat.id, file, caption=msg.caption,
+                                   caption_entities=msg.caption_entities,
+                                   reply_to_message_id=original_msg.id)
+                elif "Photo" in str(msg):
+                    bot.send_photo(original_msg.chat.id, file, caption=msg.caption,
+                                   caption_entities=msg.caption_entities,
+                                   reply_to_message_id=original_msg.id)
 
-        except FloodWait as e:
-            time.sleep(e.x)
-            reply(f"⚠️ Flood wait – retrying after {e.x}s")
-        except Exception as e:
-            reply(f"⚠️ Failed: {link} – {e}")
+                # Cleanup
+                os.remove(file)
+                if os.path.exists(up_file):
+                    os.remove(up_file)
+                try:
+                    bot.delete_messages(original_msg.chat.id, [status_msg.id])
+                except:
+                    pass
+
+                # Success, break out of retry loop
+                break 
+
+            except FloodWait as e:
+                time.sleep(e.value)
+                reply(f"⚠️ Flood wait – retrying after {e.value}s")
+                # Continue loop to retry the exact same message
+                continue 
+            except Exception as e:
+                reply(f"⚠️ Failed: {link} – {e}")
+                # Break loop on non-recoverable error
+                break 
+
+        # --- Public chat ---
+        else:
+            username = datas[-2]
+            try:
+                msg = bot.get_messages(username, msgid)
+                if msg is None:
+                    reply(f"❌ Message not found: {link}")
+                    return
+
+                if "Document" in str(msg):
+                    bot.send_document(original_msg.chat.id, msg.document.file_id,
+                                      caption=msg.caption, caption_entities=msg.caption_entities,
+                                      reply_to_message_id=original_msg.id)
+                elif "Video" in str(msg):
+                    bot.send_video(original_msg.chat.id, msg.video.file_id,
+                                   caption=msg.caption, caption_entities=msg.caption_entities,
+                                   reply_to_message_id=original_msg.id)
+                elif "Animation" in str(msg):
+                    bot.send_animation(original_msg.chat.id, msg.animation.file_id,
+                                       reply_to_message_id=original_msg.id)
+                elif "Sticker" in str(msg):
+                    bot.send_sticker(original_msg.chat.id, msg.sticker.file_id,
+                                     reply_to_message_id=original_msg.id)
+                elif "Voice" in str(msg):
+                    bot.send_voice(original_msg.chat.id, msg.voice.file_id,
+                                   caption=msg.caption, caption_entities=msg.caption_entities,
+                                   reply_to_message_id=original_msg.id)
+                elif "Audio" in str(msg):
+                    bot.send_audio(original_msg.chat.id, msg.audio.file_id,
+                                   caption=msg.caption, caption_entities=msg.caption_entities,
+                                   reply_to_message_id=original_msg.id)
+                elif "text" in str(msg):
+                    bot.send_message(original_msg.chat.id, msg.text, entities=msg.entities,
+                                     reply_to_message_id=original_msg.id)
+                elif "Photo" in str(msg):
+                    bot.send_photo(original_msg.chat.id, msg.photo.file_id,
+                                   caption=msg.caption, caption_entities=msg.caption_entities,
+                                   reply_to_message_id=original_msg.id)
+
+                # Success, break out of retry loop
+                break 
+
+            except FloodWait as e:
+                time.sleep(e.value)
+                reply(f"⚠️ Flood wait – retrying after {e.value}s")
+                # Continue loop to retry
+                continue 
+            except Exception as e:
+                reply(f"⚠️ Failed: {link} – {e}")
+                # Break loop on non-recoverable error
+                break 
 
 # --------------- Run ---------------
 bot.run()
