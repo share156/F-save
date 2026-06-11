@@ -1,9 +1,10 @@
 import pyrogram
 from pyrogram import Client, filters
 from pyrogram.errors import (
-    UserAlreadyParticipant, InviteHashExpired, FloodWait, 
+    UserAlreadyParticipant, InviteHashExpired, FloodWait,
     PeerIdInvalid, SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired,
-    ChannelPrivate, UserNotParticipant, ChatForbidden   # added for private chat errors
+    ChannelPrivate, UserNotParticipant, ChatForbidden,
+    RPCError   # new base class for all Telegram API errors
 )
 from pyrogram.types import Message
 
@@ -357,45 +358,56 @@ async def process_single_link(link, original_msg, current=0, total=0):
                 await reply(f"❌ Failed to fetch user runner session connection: `{e}`")
                 return
             
-            # Attempt to directly gather the message item with expanded error catching
+            # ----- Fixed robust private‑chat fetching -----
             try:
                 msg = await user_acc.get_messages(chatid, msgid)
                 if msg is None:
-                    # Trigger the repair block for missing/null messages
-                    raise PeerIdInvalid
-            except (PeerIdInvalid, ChannelPrivate, UserNotParticipant, ChatForbidden):
-                # Resolve peer cache by forcing dialog list scan
-                status_msg_peer = await reply("🔍 Resolving chat authorization access hashes (first-time setup)...")
-                found = False
-                try:
-                    async for dialog in user_acc.get_dialogs():
-                        if dialog.chat.id == chatid:
-                            found = True
-                            break
-                except Exception as d_err:
-                    await status_msg_peer.edit_text(f"⚠️ Failed parsing account dialog directory: `{d_err}`")
-                    return
-
-                try:
-                    await status_msg_peer.delete()
-                except Exception:
-                    pass
-
-                if found:
-                    try:
-                        msg = await user_acc.get_messages(chatid, msgid)
-                    except Exception as retry_err:
-                        await reply(f"❌ Chat verified but message collection failed: `{retry_err}`")
-                        return
-                else:
-                    await reply(
-                        "❌ **Your logged‑in account is not a member of this private chat.**\n"
-                        "Please join the chat first using an invite link, then send the message link again."
-                    )
-                    return
+                    # force the self‑healing block
+                    raise PeerIdInvalid("Message missing")
             except FloodWait as e:
                 await asyncio.sleep(e.value)
-                continue   # retry the loop
+                continue
+            except RPCError as e:
+                # All Telegram API errors (PeerIdInvalid, ChannelPrivate, etc.)
+                err_text = str(e)
+                # Check if the error indicates we don't have access to the chat
+                if any(keyword in err_text.lower() for keyword in [
+                    "peer id invalid", "channel_private", "user_not_participant",
+                    "chat_forbidden", "invalid", "not a member", "no such process"
+                ]):
+                    # Attempt to populate the peer cache by scanning dialogs
+                    status_msg_peer = await reply("🔍 Resolving chat authorization access hashes (first-time setup)...")
+                    found = False
+                    try:
+                        async for dialog in user_acc.get_dialogs():
+                            if dialog.chat.id == chatid:
+                                found = True
+                                break
+                    except Exception as d_err:
+                        try: await status_msg_peer.delete()
+                        except: pass
+                        await reply(f"⚠️ Failed parsing account dialog directory: `{d_err}`")
+                        return
+
+                    try: await status_msg_peer.delete()
+                    except: pass
+
+                    if found:
+                        try:
+                            msg = await user_acc.get_messages(chatid, msgid)
+                        except Exception as retry_err:
+                            await reply(f"❌ Chat verified but message collection failed: `{retry_err}`")
+                            return
+                    else:
+                        await reply(
+                            "❌ **Your logged‑in account is not a member of this private chat.**\n"
+                            "Please join the chat first using an invite link, then send the message link again."
+                        )
+                        return
+                else:
+                    # Unknown RPCError – report it
+                    await reply(f"⚠️ Telegram API error: `{e}`")
+                    return
             except Exception as e:
                 await reply(f"⚠️ Unexpected error while fetching message: `{e}`")
                 return
