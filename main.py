@@ -53,7 +53,6 @@ load_sessions()
 
 # --------------- Userbot Client Persistence Helper ---------------
 async def get_user_client(uid, user_data):
-    """Retrieves an existing running client or instantiates a reusable one to preserve peer cache."""
     if uid in RUNNING_CLIENTS:
         client = RUNNING_CLIENTS[uid]
         if client.is_connected:
@@ -66,7 +65,6 @@ async def get_user_client(uid, user_data):
             except: pass
             RUNNING_CLIENTS.pop(uid, None)
 
-    # Spawn fresh in-memory persistent runner instance
     client = Client(
         name=f"run_{uid}",
         api_id=user_data["api_id"],
@@ -80,7 +78,6 @@ async def get_user_client(uid, user_data):
 
 # --------------- Helper Formatter Utilities ---------------
 def get_readable_size(bytes_count):
-    """Converts a raw integer of bytes into a human-readable metric string."""
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if bytes_count < 1024.0:
             return f"{bytes_count:.2f} {unit}"
@@ -88,7 +85,6 @@ def get_readable_size(bytes_count):
     return f"{bytes_count:.2f} PB"
 
 def get_readable_time(seconds):
-    """Converts seconds into an intuitive duration string."""
     if seconds < 60:
         return f"{int(seconds)}s"
     minutes = seconds / 60
@@ -98,7 +94,14 @@ def get_readable_time(seconds):
     return f"{int(hours)}h {int(minutes % 60)}m"
 
 # --------------- Dynamic Visual Progress Callback ---------------
-async def progress_cb(current, total, status_message, action_text, tracking_ctx):
+async def progress_cb(current, total, status_message, action_text, tracking_ctx, uid):
+    """
+    Enhanced progress monitoring with an aggressive runtime cancellation interceptor.
+    """
+    # CRITICAL: If cancel command was triggered, raise an exception to force-kill Pyrogram's internal engine loop
+    if CANCEL_BATCH.get(uid, False):
+        raise StopIteration("User initiated download cancellation pipeline.")
+
     if not total:
         return
         
@@ -163,7 +166,6 @@ async def cancel_login(bot: Client, m: Message):
     
     cancelled_something = False
 
-    # 1. Clear active configuration/state machines
     if str_uid in USER_STATES:
         USER_STATES.pop(str_uid, None)
         if uid in ACTIVE_LOGINS:
@@ -173,12 +175,12 @@ async def cancel_login(bot: Client, m: Message):
             ACTIVE_LOGINS.pop(uid, None)
         cancelled_something = True
 
-    # 2. Trigger global cancel flag for link queues
+    # Activate global flag immediately to stop any active callback processing loops
     CANCEL_BATCH[uid] = True
     cancelled_something = True
 
     if cancelled_something:
-        await m.reply_text("🛑 **Cancel request received.** Halting all login registrations and downloading pipelines instantly.")
+        await m.reply_text("🛑 **Cancel command executed.** Ongoing file downloading/uploading pipelines are being completely destroyed.")
     else:
         await m.reply_text("You do not have any operations currently running.")
 
@@ -195,7 +197,7 @@ async def logout_user(bot: Client, m: Message):
     if str_uid in USER_SESSIONS:
         USER_SESSIONS.pop(str_uid, None)
         save_sessions()
-        await m.reply_text("🗑️ **Your session records have been wiped cleanly.** You will now need to login again to parse private links.")
+        await m.reply_text("🗑️ **Your session records have been wiped cleanly.**")
     else:
         await m.reply_text("You don't have an active login profile saved on this server.")
 
@@ -203,12 +205,12 @@ async def logout_user(bot: Client, m: Message):
 async def login_start(bot: Client, m: Message):
     str_uid = str(m.from_user.id)
     if str_uid in USER_SESSIONS:
-        await m.reply_text("You are already logged in! Run /logout first if you need to reconfigure accounts.")
+        await m.reply_text("You are already logged in! Run /logout first.")
         return
     
     USER_STATES[str_uid] = "WAITING_API_ID"
     ACTIVE_LOGINS[m.from_user.id] = {}
-    await m.reply_text("🔑 **Starting Secure Userbot Registration Sequence**\n\nStep 1: Please type and send your **API ID**.\n(Obtain your credentials safely via https://my.telegram.org)")
+    await m.reply_text("🔑 **Starting Secure Userbot Registration Sequence**\n\nStep 1: Please type and send your **API ID**.")
 
 # --------------- Conversation Engine & Main Process Filter ---------------
 @bot.on_message(filters.text & filters.private)
@@ -222,7 +224,7 @@ async def handle_text_inputs(client: Client, message: Message):
         
         if state == "WAITING_API_ID":
             if not text.isdigit():
-                await message.reply_text("❌ Invalid API ID. It must consist solely of numbers. Try sending it again:")
+                await message.reply_text("❌ Invalid API ID. Try sending it again:")
                 return
             ACTIVE_LOGINS[uid]["api_id"] = int(text)
             USER_STATES[str_uid] = "WAITING_API_HASH"
@@ -235,12 +237,12 @@ async def handle_text_inputs(client: Client, message: Message):
                 return
             ACTIVE_LOGINS[uid]["api_hash"] = text
             USER_STATES[str_uid] = "WAITING_PHONE"
-            await message.reply_text("📱 **Step 3:** Received API Hash. Now send your **Phone Number** with country code identifier prefix.\nExample: `+1234567890`")
+            await message.reply_text("📱 **Step 3:** Received API Hash. Now send your **Phone Number**:")
             return
 
         elif state == "WAITING_PHONE":
             if not text.startswith("+"):
-                await message.reply_text("❌ Phone number format syntax missing country identifiers. Must begin with `+`. Re-send:")
+                await message.reply_text("❌ Phone number format syntax missing country identifiers. Re-send:")
                 return
             
             await message.reply_text("⏳ Generating secure authentication environment connection instance...")
@@ -260,11 +262,11 @@ async def handle_text_inputs(client: Client, message: Message):
                 ACTIVE_LOGINS[uid]["phone_code_hash"] = code_info.phone_code_hash
                 
                 USER_STATES[str_uid] = "WAITING_OTP"
-                await message.reply_text("📩 **Step 4:** Code dispatched successfully! Please enter the **OTP Code** sent to your official Telegram app.\n\n*Format optimization Tip:* If code reads `12 345`, reply directly with compressed characters `12345` without blank spaces.")
+                await message.reply_text("📩 **Step 4:** Code dispatched successfully! Please enter the **OTP Code**:")
             except Exception as error_msg:
                 USER_STATES.pop(str_uid, None)
                 ACTIVE_LOGINS.pop(uid, None)
-                await message.reply_text(f"❌ Failed connecting client instance: `{error_msg}`\n\nRun /login to retry configuration steps cleanly.")
+                await message.reply_text(f"❌ Failed connecting client instance: `{error_msg}`")
             return
 
         elif state == "WAITING_OTP":
@@ -292,17 +294,17 @@ async def handle_text_inputs(client: Client, message: Message):
                 
                 USER_STATES.pop(str_uid, None)
                 ACTIVE_LOGINS.pop(uid, None)
-                await message.reply_text("🎉 **Login Successful!** Your profile is securely stored. Private links will process directly via your linked credentials.")
+                await message.reply_text("🎉 **Login Successful!**")
                 
             except SessionPasswordNeeded:
                 USER_STATES[str_uid] = "WAITING_2FA"
-                await message.reply_text("🔐 **Step 5 (2FA Active):** Account Cloud Two-Factor authentication requested. Please provide your profile password string below:")
+                await message.reply_text("🔐 **Step 5 (2FA Active):** Please provide your profile password string below:")
             except (PhoneCodeInvalid, PhoneCodeExpired):
-                await message.reply_text("❌ The OTP input was incorrect or expired. Please check carefully and re-send code:")
+                await message.reply_text("❌ The OTP input was incorrect or expired. Re-send code:")
             except Exception as e:
                 USER_STATES.pop(str_uid, None)
                 ACTIVE_LOGINS.pop(uid, None)
-                await message.reply_text(f"❌ Unexpected authentication error: `{e}`\nRun /login to reset configuration attempts.")
+                await message.reply_text(f"❌ Unexpected authentication error: `{e}`")
             return
 
         elif state == "WAITING_2FA":
@@ -325,31 +327,28 @@ async def handle_text_inputs(client: Client, message: Message):
                 
                 USER_STATES.pop(str_uid, None)
                 ACTIVE_LOGINS.pop(uid, None)
-                await message.reply_text("🎉 **Login Successful!** Your 2FA authentication verified. Private content parsers are fully functional.")
+                await message.reply_text("🎉 **Login Successful!**")
             except Exception as error_2fa:
-                await message.reply_text(f"❌ 2FA Password Verification Failed: `{error_2fa}`\nPlease enter your password again:")
+                await message.reply_text(f"❌ 2FA Password Verification Failed: `{error_2fa}`")
             return
 
     # --- Link Parser Logic Blocks ---
     if "https://t.me/+" in text or "https://t.me/joinchat/" in text:
         if str_uid not in USER_SESSIONS:
-            await message.reply_text("❌ **You must login first** to make your linked profile join targeted channels. Run /login.")
+            await message.reply_text("❌ **You must login first**")
             return
         
         user_data = USER_SESSIONS[str_uid]
         try:
             user_acc = await get_user_client(uid, user_data)
             await user_acc.join_chat(text)
-            await bot.send_message(message.chat.id, "**Successfully joined private chat via your account!**", reply_to_message_id=message.id)
+            await bot.send_message(message.chat.id, "**Successfully joined private chat!**", reply_to_message_id=message.id)
         except UserAlreadyParticipant:
             await bot.send_message(message.chat.id, "**Already a member of this chat group.**", reply_to_message_id=message.id)
-        except InviteHashExpired:
-            await bot.send_message(message.chat.id, "**The private invitation URL has expired.**", reply_to_message_id=message.id)
         except Exception as e:
             await bot.send_message(message.chat.id, f"⚠️ Error joining chat: `{e}`", reply_to_message_id=message.id)
         return
 
-    # Reset cancel flag before spinning up a new queue
     CANCEL_BATCH[uid] = False
 
     range_match = re.match(r'(https://t\.me/(?:c/)?[^/\s]+)(?:/\d+)?/(\d+)\s*-\s*(\d+)$', text)
@@ -367,11 +366,13 @@ async def handle_text_inputs(client: Client, message: Message):
 
         for msg_id in range(start_id, end_id + 1):
             if CANCEL_BATCH.get(uid, False):
-                await bot.send_message(message.chat.id, "❌ **Batch sequence cancelled completely.**")
                 break
             link = f"{base_link}/{msg_id}"
             await process_single_link(link, message, current=msg_id - start_id + 1, total=total)
             await asyncio.sleep(2)
+        
+        if CANCEL_BATCH.get(uid, False):
+            await bot.send_message(message.chat.id, "❌ **Batch sequence cancelled completely.**")
         return
 
     links = re.findall(r'https://t\.me/(?:c/)?[^/\s]+(?:\/\d+)?/\d+', text)
@@ -383,10 +384,12 @@ async def handle_text_inputs(client: Client, message: Message):
 
     for i, link in enumerate(links, start=1):
         if CANCEL_BATCH.get(uid, False):
-            await bot.send_message(message.chat.id, "❌ **Bulk sequence queue processing stopped.**")
             break
         await process_single_link(link, message, current=i, total=total)
         await asyncio.sleep(2)
+        
+    if CANCEL_BATCH.get(uid, False):
+        await bot.send_message(message.chat.id, "❌ **Bulk sequence queue processing stopped.**")
 
 # --------------- Engine Loop Processor (Individual Media Tasks) ---------------
 async def process_single_link(link, original_msg, current=0, total=0):
@@ -399,14 +402,13 @@ async def process_single_link(link, original_msg, current=0, total=0):
         return await bot.send_message(original_msg.chat.id, text, reply_to_message_id=original_msg.id)
 
     while True:
-        # Emergency check inside the processor engine loop
         if CANCEL_BATCH.get(uid, False):
             return
 
         # --- Route 1: Target Link Points to Private Chat Configuration Content ---
         if "https://t.me/c/" in link:
             if str_uid not in USER_SESSIONS:
-                await reply("❌ **You have not configured your account parameters yet.**\nUse /login first.")
+                await reply("❌ **You have not configured your account parameters yet.**")
                 return
 
             chatid = int("-100" + datas[4])
@@ -494,32 +496,28 @@ async def process_single_link(link, original_msg, current=0, total=0):
                         await fallback_notice.delete()
                     except Exception as f_err:
                         await fallback_notice.edit_text(
-                            f"❌ Protected/Empty Link Bypass Failed.\n"
-                            f"Reason: This link is highly protected, restricted from saving, or empty structural metadata."
+                            f"❌ Protected/Empty Link Bypass Failed."
                         )
                 break
 
-            # Check cancel flag before downloading files
             if CANCEL_BATCH.get(uid, False): return
 
-            # --- Processing Downloader Visualizations ---
             status_msg = await reply("⬇️ Connecting to target user server storage files...")
             
             download_ctx = {"start_time": time.time(), "last_edit": 0.0}
             upload_ctx = {"start_time": time.time(), "last_edit": 0.0}
 
+            file = None
             try:
+                # Download media seamlessly passing our custom uid down to track instant cancellation abort states
                 file = await user_acc.download_media(
                     msg, 
                     progress=progress_cb, 
-                    progress_args=(status_msg, f"📥 Downloading message {current}/{total}", download_ctx)
+                    progress_args=(status_msg, f"📥 Downloading message {current}/{total}", download_ctx, uid)
                 )
 
                 if CANCEL_BATCH.get(uid, False):
-                    if file and os.path.exists(file): os.remove(file)
-                    try: await status_msg.delete()
-                    except: pass
-                    return
+                    raise StopIteration("Cancelled manually")
 
                 thumb = None
                 if msg.document and msg.document.thumbs:
@@ -532,19 +530,22 @@ async def process_single_link(link, original_msg, current=0, total=0):
                     try: thumb = await user_acc.download_media(msg.audio.thumbs[0].file_id)
                     except: pass
 
+                if CANCEL_BATCH.get(uid, False):
+                    raise StopIteration("Cancelled manually")
+
                 upload_ctx["start_time"] = time.time()
                 
                 if msg.document:
                     await bot.send_document(original_msg.chat.id, file, thumb=thumb,
                                       caption=msg.caption, caption_entities=msg.caption_entities,
                                       reply_to_message_id=original_msg.id, progress=progress_cb,
-                                      progress_args=(status_msg, f"📤 Uploading message {current}/{total}", upload_ctx))
+                                      progress_args=(status_msg, f"📤 Uploading message {current}/{total}", upload_ctx, uid))
                 elif msg.video:
                     await bot.send_video(original_msg.chat.id, file, duration=msg.video.duration,
                                    width=msg.video.width, height=msg.video.height, thumb=thumb,
                                    caption=msg.caption, caption_entities=msg.caption_entities,
                                    reply_to_message_id=original_msg.id, progress=progress_cb,
-                                   progress_args=(status_msg, f"📤 Uploading message {current}/{total}", upload_ctx))
+                                   progress_args=(status_msg, f"📤 Uploading message {current}/{total}", upload_ctx, uid))
                 elif msg.animation:
                     await bot.send_animation(original_msg.chat.id, file, reply_to_message_id=original_msg.id)
                 elif msg.sticker:
@@ -565,10 +566,18 @@ async def process_single_link(link, original_msg, current=0, total=0):
                 except: pass
                 break 
 
+            except (StopIteration, asyncio.CancelledError):
+                # Clean up dirty partial cache downloads left behind instantly
+                if file and os.path.exists(file): os.remove(file)
+                try: await status_msg.delete()
+                except: pass
+                return
+
             except FloodWait as e:
                 await asyncio.sleep(e.value)
                 continue
             except Exception as e:
+                if file and os.path.exists(file): os.remove(file)
                 await reply(f"⚠️ Processing pipeline failed on link: {link} – Trace: `{e}`")
                 break
 
@@ -614,3 +623,4 @@ async def process_single_link(link, original_msg, current=0, total=0):
 
 # --------------- Start Application Execution ---------------
 bot.run()
+
