@@ -6,9 +6,9 @@ from pyrogram.errors import (
 )
 from pyrogram.types import Message
 
+import asyncio
 import time
 import os
-import threading
 import re
 import json
 
@@ -45,55 +45,29 @@ def save_sessions():
 # Load active storage databases at startup
 load_sessions()
 
-# --------------- Progress helpers ---------------
-def progress_bar(percent):
-    """Returns a visual progress bar string."""
-    filled = int(20 * percent / 100)
-    return f"[{'█' * filled}{'░' * (20 - filled)}] {percent:.1f}%"
-
-def make_progress_callback(status_filename):
-    """Writes download/upload percentage to a file (called by Pyrogram)."""
-    def progress(current, total):
-        with open(status_filename, "w") as f:
-            f.write(f"{current * 100 / total:.1f}")
-    return progress
-
-# --------------- Real‑time status updater (runs in a thread) ---------------
-def status_updater(status_file, status_message, total_message_count=None):
-    """Reads percentages from the active status file and edits tracking text frames."""
-    last_text = ""
-    while True:
-        if os.path.exists(status_file):
-            with open(status_file, "r") as f:
-                percent_str = f.read().strip()
-            if percent_str:
-                try:
-                    percent = float(percent_str)
-                    bar = progress_bar(percent)
-                    if total_message_count:
-                        new_text = f"{bar}\n📦 Processing message {total_message_count}"
-                    else:
-                        new_text = bar
-                    if new_text != last_text:
-                        bot.edit_message_text(
-                            status_message.chat.id,
-                            status_message.id,
-                            new_text
-                        )
-                        last_text = new_text
-                except:
-                    pass
-            time.sleep(2)
-        else:
-            time.sleep(1)
+# --------------- Throttled Progress Callback ---------------
+async def progress_cb(current, total, status_message, action_text, last_update_ref):
+    if not total:
+        return
+    percent = current * 100 / total
+    now = time.time()
+    # Edit at most every 3 seconds to strictly avoid Telegram FloodWait rate limits
+    if now - last_update_ref[0] >= 3.0 or current == total:
+        last_update_ref[0] = now
+        filled = int(20 * percent / 100)
+        bar = f"[{'█' * filled}{'░' * (20 - filled)}] {percent:.1f}%"
+        try:
+            await status_message.edit_text(f"{action_text}\n\n{bar}")
+        except Exception:
+            pass
 
 # --------------- Utility Command Handlers ---------------
-@bot.on_message(filters.command(["start"]))
-def start(bot: Client, m: Message):
+@bot.on_message(filters.command(["start"]) & filters.private)
+async def start(bot: Client, m: Message):
     uid = str(m.from_user.id)
     status = "✅ Connected" if uid in USER_SESSIONS else "❌ Not Logged In"
     
-    m.reply_text(
+    await m.reply_text(
         f"**Welcome to the Restricted Content Saver Bot**\n\n"
         f"Your Login Status: {status}\n\n"
         "**Commands:**\n"
@@ -105,8 +79,8 @@ def start(bot: Client, m: Message):
         "`https://t.me/c/xxxx/100 - 200`"
     )
 
-@bot.on_message(filters.command(["cancel"]))
-def cancel_login(bot: Client, m: Message):
+@bot.on_message(filters.command(["cancel"]) & filters.private)
+async def cancel_login(bot: Client, m: Message):
     uid = m.from_user.id
     str_uid = str(uid)
     
@@ -114,37 +88,37 @@ def cancel_login(bot: Client, m: Message):
         USER_STATES.pop(str_uid, None)
         if uid in ACTIVE_LOGINS:
             try:
-                ACTIVE_LOGINS[uid]["client"].disconnect()
+                await ACTIVE_LOGINS[uid]["client"].disconnect()
             except: pass
             ACTIVE_LOGINS.pop(uid, None)
-        m.reply_text("✅ Ongoing setup operations have been successfully canceled.")
+        await m.reply_text("✅ Ongoing setup operations have been successfully canceled.")
     else:
-        m.reply_text("You do not have any active registration flows currently running.")
+        await m.reply_text("You do not have any active registration flows currently running.")
 
-@bot.on_message(filters.command(["logout"]))
-def logout_user(bot: Client, m: Message):
+@bot.on_message(filters.command(["logout"]) & filters.private)
+async def logout_user(bot: Client, m: Message):
     str_uid = str(m.from_user.id)
     if str_uid in USER_SESSIONS:
         USER_SESSIONS.pop(str_uid, None)
         save_sessions()
-        m.reply_text("🗑️ **Your session records have been wiped cleanly.** You will now need to login again to parse private links.")
+        await m.reply_text("🗑️ **Your session records have been wiped cleanly.** You will now need to login again to parse private links.")
     else:
-        m.reply_text("You don't have an active login profile saved on this server.")
+        await m.reply_text("You don't have an active login profile saved on this server.")
 
-@bot.on_message(filters.command(["login"]))
-def login_start(bot: Client, m: Message):
+@bot.on_message(filters.command(["login"]) & filters.private)
+async def login_start(bot: Client, m: Message):
     str_uid = str(m.from_user.id)
     if str_uid in USER_SESSIONS:
-        m.reply_text("You are already logged in! Run /logout first if you need to reconfigure accounts.")
+        await m.reply_text("You are already logged in! Run /logout first if you need to reconfigure accounts.")
         return
     
     USER_STATES[str_uid] = "WAITING_API_ID"
     ACTIVE_LOGINS[m.from_user.id] = {}
-    m.reply_text("🔑 **Starting Secure Userbot Registration Sequence**\n\nStep 1: Please type and send your **API ID**.\n(Obtain your credentials safely via https://my.telegram.org)")
+    await m.reply_text("🔑 **Starting Secure Userbot Registration Sequence**\n\nStep 1: Please type and send your **API ID**.\n(Obtain your credentials safely via https://my.telegram.org)")
 
 # --------------- Conversation Engine & Main Process Filter ---------------
 @bot.on_message(filters.text & filters.private)
-def handle_text_inputs(client: Client, message: Message):
+async def handle_text_inputs(client: Client, message: Message):
     uid = message.from_user.id
     str_uid = str(uid)
     text = message.text.strip()
@@ -155,50 +129,49 @@ def handle_text_inputs(client: Client, message: Message):
         
         if state == "WAITING_API_ID":
             if not text.isdigit():
-                message.reply_text("❌ Invalid API ID. It must consist solely of numbers. Try sending it again:")
+                await message.reply_text("❌ Invalid API ID. It must consist solely of numbers. Try sending it again:")
                 return
             ACTIVE_LOGINS[uid]["api_id"] = int(text)
             USER_STATES[str_uid] = "WAITING_API_HASH"
-            message.reply_text("⚙️ **Step 2:** Received API ID. Now send your **API HASH** key string:")
+            await message.reply_text("⚙️ **Step 2:** Received API ID. Now send your **API HASH** key string:")
             return
 
         elif state == "WAITING_API_HASH":
             if len(text) < 10:
-                message.reply_text("❌ Invalid API HASH key structure detected. Please review and send again:")
+                await message.reply_text("❌ Invalid API HASH key structure detected. Please review and send again:")
                 return
             ACTIVE_LOGINS[uid]["api_hash"] = text
             USER_STATES[str_uid] = "WAITING_PHONE"
-            message.reply_text("📱 **Step 3:** Received API Hash. Now send your **Phone Number** with country code identifier prefix.\nExample: `+1234567890`")
+            await message.reply_text("📱 **Step 3:** Received API Hash. Now send your **Phone Number** with country code identifier prefix.\nExample: `+1234567890`")
             return
 
         elif state == "WAITING_PHONE":
             if not text.startswith("+"):
-                message.reply_text("❌ Phone number format syntax missing country identifiers. Must begin with `+`. Re-send:")
+                await message.reply_text("❌ Phone number format syntax missing country identifiers. Must begin with `+`. Re-send:")
                 return
             
-            message.reply_text("⏳ Generating secure authentication environment connection instance...")
+            await message.reply_text("⏳ Generating secure authentication environment connection instance...")
             ACTIVE_LOGINS[uid]["phone"] = text
             
             try:
-                # Spawn dynamic in-memory authentication client running on user's target API credentials
                 temp_client = Client(
                     name=f"login_{uid}",
                     api_id=ACTIVE_LOGINS[uid]["api_id"],
                     api_hash=ACTIVE_LOGINS[uid]["api_hash"],
                     in_memory=True
                 )
-                temp_client.connect()
-                code_info = temp_client.send_code(text)
+                await temp_client.connect()
+                code_info = await temp_client.send_code(text)
                 
                 ACTIVE_LOGINS[uid]["client"] = temp_client
                 ACTIVE_LOGINS[uid]["phone_code_hash"] = code_info.phone_code_hash
                 
                 USER_STATES[str_uid] = "WAITING_OTP"
-                message.reply_text("📩 **Step 4:** Code dispatched successfully! Please enter the **OTP Code** sent to your official Telegram app.\n\n*Format optimization Tip:* If code reads `12 345`, reply directly with compressed characters `12345` without blank spaces.")
+                await message.reply_text("📩 **Step 4:** Code dispatched successfully! Please enter the **OTP Code** sent to your official Telegram app.\n\n*Format optimization Tip:* If code reads `12 345`, reply directly with compressed characters `12345` without blank spaces.")
             except Exception as error_msg:
                 USER_STATES.pop(str_uid, None)
                 ACTIVE_LOGINS.pop(uid, None)
-                message.reply_text(f"❌ Failed connecting client instance: `{error_msg}`\n\nRun /login to retry configuration steps cleanly.")
+                await message.reply_text(f"❌ Failed connecting client instance: `{error_msg}`\n\nRun /login to retry configuration steps cleanly.")
             return
 
         elif state == "WAITING_OTP":
@@ -207,14 +180,13 @@ def handle_text_inputs(client: Client, message: Message):
             temp_client = login_data["client"]
             
             try:
-                temp_client.sign_in(
+                await temp_client.sign_in(
                     phone_number=login_data["phone"],
                     phone_code_hash=login_data["phone_code_hash"],
                     phone_code=clean_otp
                 )
                 
-                # Sign in complete without 2FA
-                session_str = temp_client.export_session_string()
+                session_str = await temp_client.export_session_string()
                 USER_SESSIONS[str_uid] = {
                     "api_id": login_data["api_id"],
                     "api_hash": login_data["api_hash"],
@@ -222,22 +194,22 @@ def handle_text_inputs(client: Client, message: Message):
                 }
                 save_sessions()
                 
-                try: temp_client.disconnect()
+                try: await temp_client.disconnect()
                 except: pass
                 
                 USER_STATES.pop(str_uid, None)
                 ACTIVE_LOGINS.pop(uid, None)
-                message.reply_text("🎉 **Login Successful!** Your profile is securely stored. Private links will process directly via your linked credentials.")
+                await message.reply_text("🎉 **Login Successful!** Your profile is securely stored. Private links will process directly via your linked credentials.")
                 
             except SessionPasswordNeeded:
                 USER_STATES[str_uid] = "WAITING_2FA"
-                message.reply_text("🔐 **Step 5 (2FA Active):** Account Cloud Two-Factor authentication requested. Please provide your profile password string below:")
+                await message.reply_text("🔐 **Step 5 (2FA Active):** Account Cloud Two-Factor authentication requested. Please provide your profile password string below:")
             except (PhoneCodeInvalid, PhoneCodeExpired):
-                message.reply_text("❌ The OTP input was incorrect or expired. Please check carefully and re-send code:")
+                await message.reply_text("❌ The OTP input was incorrect or expired. Please check carefully and re-send code:")
             except Exception as e:
                 USER_STATES.pop(str_uid, None)
                 ACTIVE_LOGINS.pop(uid, None)
-                message.reply_text(f"❌ Unexpected authentication error: `{e}`\nRun /login to reset configuration attempts.")
+                await message.reply_text(f"❌ Unexpected authentication error: `{e}`\nRun /login to reset configuration attempts.")
             return
 
         elif state == "WAITING_2FA":
@@ -245,8 +217,8 @@ def handle_text_inputs(client: Client, message: Message):
             temp_client = login_data["client"]
             
             try:
-                temp_client.check_password(password=text)
-                session_str = temp_client.export_session_string()
+                await temp_client.check_password(password=text)
+                session_str = await temp_client.export_session_string()
                 
                 USER_SESSIONS[str_uid] = {
                     "api_id": login_data["api_id"],
@@ -255,35 +227,36 @@ def handle_text_inputs(client: Client, message: Message):
                 }
                 save_sessions()
                 
-                try: temp_client.disconnect()
+                try: await temp_client.disconnect()
                 except: pass
                 
                 USER_STATES.pop(str_uid, None)
                 ACTIVE_LOGINS.pop(uid, None)
-                message.reply_text("🎉 **Login Successful!** Your 2FA authentication verified. Private content parsers are fully functional.")
+                await message.reply_text("🎉 **Login Successful!** Your 2FA authentication verified. Private content parsers are fully functional.")
             except Exception as error_2fa:
-                message.reply_text(f"❌ 2FA Password Verification Failed: `{error_2fa}`\nPlease enter your password again:")
+                await message.reply_text(f"❌ 2FA Password Verification Failed: `{error_2fa}`\nPlease enter your password again:")
             return
 
     # --- Link Parser Logic Blocks (Normal Non-State Text Checks) ---
     # 1. Join private invitation codes
     if "https://t.me/+" in text or "https://t.me/joinchat/" in text:
         if str_uid not in USER_SESSIONS:
-            message.reply_text("❌ **You must login first** to make your linked profile join targeted channels. Run /login.")
+            await message.reply_text("❌ **You must login first** to make your linked profile join targeted channels. Run /login.")
             return
         
         user_data = USER_SESSIONS[str_uid]
-        user_acc = Client(f"run_{uid}", api_id=user_data["api_id"], api_hash=user_data["api_hash"], session_string=user_data["session_string"])
+        user_acc = Client(f"run_{uid}", api_id=user_data["api_id"], api_hash=user_data["api_hash"], session_string=user_data["session_string"], in_memory=True)
         try:
-            with user_acc:
-                user_acc.join_chat(text)
-            bot.send_message(message.chat.id, "**Successfully joined private chat via your account!**", reply_to_message_id=message.id)
+            await user_acc.start()
+            await user_acc.join_chat(text)
+            await user_acc.stop()
+            await bot.send_message(message.chat.id, "**Successfully joined private chat via your account!**", reply_to_message_id=message.id)
         except UserAlreadyParticipant:
-            bot.send_message(message.chat.id, "**Already a member of this chat group.**", reply_to_message_id=message.id)
+            await bot.send_message(message.chat.id, "**Already a member of this chat group.**", reply_to_message_id=message.id)
         except InviteHashExpired:
-            bot.send_message(message.chat.id, "**The private invitation URL has expired.**", reply_to_message_id=message.id)
+            await bot.send_message(message.chat.id, "**The private invitation URL has expired.**", reply_to_message_id=message.id)
         except Exception as e:
-            bot.send_message(message.chat.id, f"⚠️ Error joining chat: `{e}`", reply_to_message_id=message.id)
+            await bot.send_message(message.chat.id, f"⚠️ Error joining chat: `{e}`", reply_to_message_id=message.id)
         return
 
     # 2. Sequential ranges handling
@@ -294,16 +267,16 @@ def handle_text_inputs(client: Client, message: Message):
         end_id = int(range_match.group(3))
 
         if end_id < start_id:
-            bot.send_message(message.chat.id, "End ID must be larger than start ID.")
+            await bot.send_message(message.chat.id, "End ID must be larger than start ID.")
             return
 
         total = end_id - start_id + 1
-        bot.send_message(message.chat.id, f"Processing batch queue extraction: {start_id} → {end_id} ({total} links)")
+        await bot.send_message(message.chat.id, f"Processing batch queue extraction: {start_id} → {end_id} ({total} links)")
 
         for msg_id in range(start_id, end_id + 1):
             link = f"{base_link}/{msg_id}"
-            process_single_link(link, message, current=msg_id - start_id + 1, total=total)
-            time.sleep(2)
+            await process_single_link(link, message, current=msg_id - start_id + 1, total=total)
+            await asyncio.sleep(2)
         return
 
     # 3. Direct Bulk Link Detections
@@ -312,169 +285,168 @@ def handle_text_inputs(client: Client, message: Message):
         return
 
     total = len(links)
-    bot.send_message(message.chat.id, f"Found {total} link(s). Initializing parsing queue...", reply_to_message_id=message.id)
+    await bot.send_message(message.chat.id, f"Found {total} link(s). Initializing parsing queue...", reply_to_message_id=message.id)
 
     for i, link in enumerate(links, start=1):
-        process_single_link(link, message, current=i, total=total)
-        time.sleep(2)
+        await process_single_link(link, message, current=i, total=total)
+        await asyncio.sleep(2)
 
 # --------------- Engine Loop Processor (Individual Media Tasks) ---------------
-def process_single_link(link, original_msg, current=0, total=0):
+async def process_single_link(link, original_msg, current=0, total=0):
     datas = link.split("/")
     msgid = int(datas[-1])
     uid = original_msg.from_user.id
     str_uid = str(uid)
 
-    def reply(text):
-        return bot.send_message(original_msg.chat.id, text, reply_to_message_id=original_msg.id)
+    async def reply(text):
+        return await bot.send_message(original_msg.chat.id, text, reply_to_message_id=original_msg.id)
 
     while True:
         # --- Route 1: Target Link Points to Private Chat Configuration Content ---
         if "https://t.me/c/" in link:
             if str_uid not in USER_SESSIONS:
-                reply("❌ **You have not configured your account parameters yet.**\nUse /login first to handle tracking operations on private chat URLs safely via your own session.")
+                await reply("❌ **You have not configured your account parameters yet.**\nUse /login first to handle tracking operations on private chat URLs safely via your own session.")
                 return
 
             chatid = int("-100" + datas[-2])
             user_data = USER_SESSIONS[str_uid]
             
-            # Instantiate user's account client dynamically for processing private downloads safely
             user_acc = Client(
                 name=f"run_{uid}",
                 api_id=user_data["api_id"],
                 api_hash=user_data["api_hash"],
-                session_string=user_data["session_string"]
+                session_string=user_data["session_string"],
+                in_memory=True
             )
             
             try:
-                with user_acc:
-                    try:
-                        user_acc.get_chat(chatid)
-                    except PeerIdInvalid:
-                        reply("❌ **Your logged in userbot account is not a member of this private chat group.**\nPlease join the chat first using your profile link.")
-                        return
-
-                    msg = user_acc.get_messages(chatid, msgid)
-                
-                if msg is None:
-                    reply(f"❌ Target item data was missing or not found: {link}")
+                await user_acc.start()
+                try:
+                    await user_acc.get_chat(chatid)
+                except PeerIdInvalid:
+                    await reply("❌ **Your logged in userbot account is not a member of this private chat group.**\nPlease join the chat first using your profile link.")
+                    await user_acc.stop()
                     return
 
-                if "text" in str(msg) and not msg.media:
-                    reply(msg.text)
+                msg = await user_acc.get_messages(chatid, msgid)
+                
+                if msg is None:
+                    await reply(f"❌ Target item data was missing or not found: {link}")
+                    await user_acc.stop()
+                    return
+
+                if msg.text and not msg.media:
+                    await reply(msg.text)
+                    await user_acc.stop()
                     return 
 
                 # --- Processing Downloader Visualizations ---
-                sid = f"{original_msg.id}_{current}"
-                down_file = f"{sid}downstatus.txt"
-                up_file = f"{sid}upstatus.txt"
+                status_msg = await reply("⬇️ Connecting to target user server storage files...")
+                last_update_ref = [0.0]
 
-                status_msg = reply("⬇️ Connecting to target user server storage files...")
-                tracker = threading.Thread(target=status_updater, args=(down_file, status_msg, f"{current}/{total}"), daemon=True)
-                tracker.start()
-
-                # Download media using user's custom client
-                with user_acc:
-                    file = user_acc.download_media(msg, progress=make_progress_callback(down_file))
-                
-                if os.path.exists(down_file):
-                    os.remove(down_file)
-
-                up_tracker = threading.Thread(target=status_updater, args=(up_file, status_msg, f"{current}/{total}"), daemon=True)
-                up_tracker.start()
+                # Download media cleanly with native async callback updates
+                file = await user_acc.download_media(
+                    msg, 
+                    progress=progress_cb, 
+                    progress_args=(status_msg, f"⬇️ Downloading message {current}/{total}", last_update_ref)
+                )
 
                 thumb = None
-                with user_acc:
-                    if "Document" in str(msg) and msg.document.thumbs:
-                        try: thumb = user_acc.download_media(msg.document.thumbs[0].file_id)
-                        except: pass
-                    elif "Video" in str(msg) and msg.video.thumbs:
-                        try: thumb = user_acc.download_media(msg.video.thumbs[0].file_id)
-                        except: pass
-                    elif "Audio" in str(msg) and msg.audio.thumbs:
-                        try: thumb = user_acc.download_media(msg.audio.thumbs[0].file_id)
-                        except: pass
+                if msg.document and msg.document.thumbs:
+                    try: thumb = await user_acc.download_media(msg.document.thumbs[0].file_id)
+                    except: pass
+                elif msg.video and msg.video.thumbs:
+                    try: thumb = await user_acc.download_media(msg.video.thumbs[0].file_id)
+                    except: pass
+                elif msg.audio and msg.audio.thumbs:
+                    try: thumb = await user_acc.download_media(msg.audio.thumbs[0].file_id)
+                    except: pass
 
-                # Forward cleanly into target bot chat output allocations
-                if "Document" in str(msg):
-                    bot.send_document(original_msg.chat.id, file, thumb=thumb,
+                last_update_ref = [0.0]
+                if msg.document:
+                    await bot.send_document(original_msg.chat.id, file, thumb=thumb,
                                       caption=msg.caption, caption_entities=msg.caption_entities,
-                                      reply_to_message_id=original_msg.id, progress=make_progress_callback(up_file))
-                elif "Video" in str(msg):
-                    bot.send_video(original_msg.chat.id, file, duration=msg.video.duration,
+                                      reply_to_message_id=original_msg.id, progress=progress_cb,
+                                      progress_args=(status_msg, f"⬆️ Uploading message {current}/{total}", last_update_ref))
+                elif msg.video:
+                    await bot.send_video(original_msg.chat.id, file, duration=msg.video.duration,
                                    width=msg.video.width, height=msg.video.height, thumb=thumb,
                                    caption=msg.caption, caption_entities=msg.caption_entities,
-                                   reply_to_message_id=original_msg.id, progress=make_progress_callback(up_file))
-                elif "Animation" in str(msg):
-                    bot.send_animation(original_msg.chat.id, file, reply_to_message_id=original_msg.id)
-                elif "Sticker" in str(msg):
-                    bot.send_sticker(original_msg.chat.id, file, reply_to_message_id=original_msg.id)
-                elif "Voice" in str(msg):
-                    bot.send_voice(original_msg.chat.id, file, caption=msg.caption, reply_to_message_id=original_msg.id)
-                elif "Audio" in str(msg):
-                    bot.send_audio(original_msg.chat.id, file, caption=msg.caption,
+                                   reply_to_message_id=original_msg.id, progress=progress_cb,
+                                   progress_args=(status_msg, f"⬆️ Uploading message {current}/{total}", last_update_ref))
+                elif msg.animation:
+                    await bot.send_animation(original_msg.chat.id, file, reply_to_message_id=original_msg.id)
+                elif msg.sticker:
+                    await bot.send_sticker(original_msg.chat.id, file, reply_to_message_id=original_msg.id)
+                elif msg.voice:
+                    await bot.send_voice(original_msg.chat.id, file, caption=msg.caption, reply_to_message_id=original_msg.id)
+                elif msg.audio:
+                    await bot.send_audio(original_msg.chat.id, file, caption=msg.caption,
                                    caption_entities=msg.caption_entities, reply_to_message_id=original_msg.id)
-                elif "Photo" in str(msg):
-                    bot.send_photo(original_msg.chat.id, file, caption=msg.caption,
+                elif msg.photo:
+                    await bot.send_photo(original_msg.chat.id, file, caption=msg.caption,
                                    caption_entities=msg.caption_entities, reply_to_message_id=original_msg.id)
 
-                # Post processing system scrubbing sweeps
-                if os.path.exists(file): os.remove(file)
+                if file and os.path.exists(file): os.remove(file)
                 if thumb and os.path.exists(thumb): os.remove(thumb)
-                if os.path.exists(up_file): os.remove(up_file)
                 
-                try: bot.delete_messages(original_msg.chat.id, [status_msg.id])
+                try: await status_msg.delete()
                 except: pass
 
-                break # Completed processing without crashing loops
+                await user_acc.stop()
+                break 
 
             except FloodWait as e:
-                time.sleep(e.value)
-                reply(f"⚠️ Flood wait limits triggered – retrying same item index after waiting {e.value}s")
+                try: await user_acc.stop()
+                except: pass
+                await asyncio.sleep(e.value)
+                await reply(f"⚠️ Flood wait limits triggered – retrying same item index after waiting {e.value}s")
                 continue
             except Exception as e:
-                reply(f"⚠️ Extraction block error on link: {link} – Trace: `{e}`")
+                try: await user_acc.stop()
+                except: pass
+                await reply(f"⚠️ Extraction block error on link: {link} – Trace: `{e}`")
                 break
 
         # --- Route 2: Target Link Points to Public Chat Settings ---
         else:
             username = datas[-2]
             try:
-                msg = bot.get_messages(username, msgid)
+                msg = await bot.get_messages(username, msgid)
                 if msg is None:
-                    reply(f"❌ Message not found: {link}")
+                    await reply(f"❌ Message not found: {link}")
                     return
 
-                if "Document" in str(msg):
-                    bot.send_document(original_msg.chat.id, msg.document.file_id,
+                if msg.document:
+                    await bot.send_document(original_msg.chat.id, msg.document.file_id,
                                       caption=msg.caption, caption_entities=msg.caption_entities, reply_to_message_id=original_msg.id)
-                elif "Video" in str(msg):
-                    bot.send_video(original_msg.chat.id, msg.video.file_id,
+                elif msg.video:
+                    await bot.send_video(original_msg.chat.id, msg.video.file_id,
                                    caption=msg.caption, caption_entities=msg.caption_entities, reply_to_message_id=original_msg.id)
-                elif "Animation" in str(msg):
-                    bot.send_animation(original_msg.chat.id, msg.animation.file_id, reply_to_message_id=original_msg.id)
-                elif "Sticker" in str(msg):
-                    bot.send_sticker(original_msg.chat.id, msg.sticker.file_id, reply_to_message_id=original_msg.id)
-                elif "Voice" in str(msg):
-                    bot.send_voice(original_msg.chat.id, msg.voice.file_id,
+                elif msg.animation:
+                    await bot.send_animation(original_msg.chat.id, msg.animation.file_id, reply_to_message_id=original_msg.id)
+                elif msg.sticker:
+                    await bot.send_sticker(original_msg.chat.id, msg.sticker.file_id, reply_to_message_id=original_msg.id)
+                elif msg.voice:
+                    await bot.send_voice(original_msg.chat.id, msg.voice.file_id,
                                    caption=msg.caption, caption_entities=msg.caption_entities, reply_to_message_id=original_msg.id)
-                elif "Audio" in str(msg):
-                    bot.send_audio(original_msg.chat.id, msg.audio.file_id,
+                elif msg.audio:
+                    await bot.send_audio(original_msg.chat.id, msg.audio.file_id,
                                    caption=msg.caption, caption_entities=msg.caption_entities, reply_to_message_id=original_msg.id)
-                elif "text" in str(msg):
-                    bot.send_message(original_msg.chat.id, msg.text, entities=msg.entities, reply_to_message_id=original_msg.id)
-                elif "Photo" in str(msg):
-                    bot.send_photo(original_msg.chat.id, msg.photo.file_id,
+                elif msg.text:
+                    await bot.send_message(original_msg.chat.id, msg.text, entities=msg.entities, reply_to_message_id=original_msg.id)
+                elif msg.photo:
+                    await bot.send_photo(original_msg.chat.id, msg.photo.file_id,
                                    caption=msg.caption, caption_entities=msg.caption_entities, reply_to_message_id=original_msg.id)
 
                 break
 
             except FloodWait as e:
-                time.sleep(e.value)
-                reply(f"⚠️ Flood wait – resuming extraction task in {e.value}s")
+                await asyncio.sleep(e.value)
+                await reply(f"⚠️ Flood wait – resuming extraction task in {e.value}s")
                 continue 
             except Exception as e:
-                reply(f"⚠️ Public parsing operation error: {link} – `{e}`")
+                await reply(f"⚠️ Public parsing operation error: {link} – `{e}`")
                 break 
 
 # --------------- Start Application Execution ---------------
