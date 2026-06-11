@@ -98,20 +98,13 @@ def get_readable_time(seconds):
 
 # --------------- Dynamic Visual Progress Callback ---------------
 async def progress_cb(current, total, status_message, action_text, tracking_ctx):
-    """
-    Calculates detailed real-time performance analytics:
-    Speed, human sizes, progress percentages, and structural ETA.
-    tracking_ctx is expected to be a dict: {"start_time": float, "last_edit": float}
-    """
     if not total:
         return
         
     now = time.time()
-    # Edit at most every 3.5 seconds to protect account from strict TG Flood limit safety rules
     if now - tracking_ctx.get("last_edit", 0.0) >= 3.5 or current == total:
         tracking_ctx["last_edit"] = now
         
-        # Performance Analytics Calculations
         elapsed_time = now - tracking_ctx["start_time"]
         if elapsed_time <= 0:
             elapsed_time = 0.01
@@ -119,17 +112,14 @@ async def progress_cb(current, total, status_message, action_text, tracking_ctx)
         speed_bps = current / elapsed_time
         percent = current * 100 / total
         
-        # Calculate Time Remaining (ETA)
         bytes_remaining = total - current
         eta_seconds = bytes_remaining / speed_bps if speed_bps > 0 else 0
         
-        # String Conversions
         readable_current = get_readable_size(current)
         readable_total = get_readable_size(total)
         readable_speed = f"{get_readable_size(speed_bps)}/s"
         readable_eta = get_readable_time(eta_seconds) if current < total else "0s"
         
-        # Build Visual Block Components
         filled = int(20 * percent / 100)
         bar = f"[{'█' * filled}{'░' * (20 - filled)}] {percent:.1f}%"
         
@@ -185,7 +175,6 @@ async def logout_user(bot: Client, m: Message):
     uid = m.from_user.id
     str_uid = str(uid)
     
-    # Cleanly stop any active persistent background sessions
     if uid in RUNNING_CLIENTS:
         try: await RUNNING_CLIENTS[uid].stop()
         except: pass
@@ -216,7 +205,6 @@ async def handle_text_inputs(client: Client, message: Message):
     str_uid = str(uid)
     text = message.text.strip()
 
-    # --- Check Login State Machine Flow First ---
     if str_uid in USER_STATES:
         state = USER_STATES[str_uid]
         
@@ -330,8 +318,7 @@ async def handle_text_inputs(client: Client, message: Message):
                 await message.reply_text(f"❌ 2FA Password Verification Failed: `{error_2fa}`\nPlease enter your password again:")
             return
 
-    # --- Link Parser Logic Blocks (Normal Non-State Text Checks) ---
-    # 1. Join private invitation codes
+    # --- Link Parser Logic Blocks ---
     if "https://t.me/+" in text or "https://t.me/joinchat/" in text:
         if str_uid not in USER_SESSIONS:
             await message.reply_text("❌ **You must login first** to make your linked profile join targeted channels. Run /login.")
@@ -350,7 +337,6 @@ async def handle_text_inputs(client: Client, message: Message):
             await bot.send_message(message.chat.id, f"⚠️ Error joining chat: `{e}`", reply_to_message_id=message.id)
         return
 
-    # 2. Sequential ranges handling
     range_match = re.match(r'(https://t\.me/(?:c/)?[^/\s]+)(?:/\d+)?/(\d+)\s*-\s*(\d+)$', text)
     if range_match:
         base_link = range_match.group(1)
@@ -370,7 +356,6 @@ async def handle_text_inputs(client: Client, message: Message):
             await asyncio.sleep(2)
         return
 
-    # 3. Direct Bulk Link Detections (Supports Topic URL formats cleanly)
     links = re.findall(r'https://t\.me/(?:c/)?[^/\s]+(?:\/\d+)?/\d+', text)
     if not links:
         return
@@ -396,10 +381,9 @@ async def process_single_link(link, original_msg, current=0, total=0):
         # --- Route 1: Target Link Points to Private Chat Configuration Content ---
         if "https://t.me/c/" in link:
             if str_uid not in USER_SESSIONS:
-                await reply("❌ **You have not configured your account parameters yet.**\nUse /login first to handle tracking operations on private chat URLs safely via your own session.")
+                await reply("❌ **You have not configured your account parameters yet.**\nUse /login first.")
                 return
 
-            # Extract chat ID properly even if a topic ID sits in the middle of the link structure
             chatid = int("-100" + datas[4])
             user_data = USER_SESSIONS[str_uid]
             
@@ -412,25 +396,20 @@ async def process_single_link(link, original_msg, current=0, total=0):
                 await reply(f"❌ Failed to fetch user runner session connection: `{e}`")
                 return
             
-            # ----- Fixed robust private‑chat fetching -----
             try:
                 msg = await user_acc.get_messages(chatid, msgid)
                 if msg is None:
-                    # Force the self-healing block safely
                     raise ValueError("message missing")
             except FloodWait as e:
                 await asyncio.sleep(e.value)
                 continue
             except (RPCError, ValueError) as e:
-                # Now catching both API errors AND local cache missing errors
                 err_text = str(e).lower()
-                
                 if any(keyword in err_text for keyword in [
                     "peer id invalid", "peer_id_invalid", "channel_private", "user_not_participant",
                     "chat_forbidden", "invalid", "not a member", "no such process", "message missing"
                 ]):
-                    # Attempt to populate the peer cache by scanning dialogs
-                    status_msg_peer = await reply("🔍 Resolving chat authorization access hashes (first-time setup)...")
+                    status_msg_peer = await reply("🔍 Resolving chat authorization access hashes...")
                     found = False
                     try:
                         async for dialog in user_acc.get_dialogs():
@@ -453,30 +432,26 @@ async def process_single_link(link, original_msg, current=0, total=0):
                             await reply(f"❌ Chat verified but message collection failed: `{retry_err}`")
                             return
                     else:
-                        await reply(
-                            "❌ **Your logged‑in account is not a member of this private chat.**\n"
-                            "Please join the chat first using an invite link, then send the message link again."
-                        )
+                        await reply("❌ **Your logged‑in account is not a member of this private chat.**")
                         return
                 else:
-                    # Unknown RPCError – report it
                     await reply(f"⚠️ Telegram API error: `{e}`")
                     return
             except Exception as e:
                 await reply(f"⚠️ Unexpected error while fetching message: `{e}`")
                 return
 
-            # Validate that the extracted package actually contains target assets
             if msg is None:
                 await reply(f"❌ Target item data was missing or not found on server: {link}")
                 return
 
-            # Check if there is any actual physical file attached to download (skips link previews safely)
+            # Check if there is any actual physical file attached to download
             has_downloadable_media = any([
                 msg.document, msg.video, msg.animation, 
                 msg.sticker, msg.voice, msg.audio, msg.photo
             ])
 
+            # --- DYNAMIC CRASH RECOVERY FALLBACK ---
             if not has_downloadable_media:
                 text_to_send = msg.text or msg.caption
                 if text_to_send:
@@ -487,18 +462,26 @@ async def process_single_link(link, original_msg, current=0, total=0):
                         reply_to_message_id=original_msg.id
                     )
                 else:
-                    await reply("⚠️ This message does not contain any supported media or text.")
+                    # If it completely fails to identify media but you know a video is there, 
+                    # we trigger an aggressive system-level message copy fallback directly using the userbot string.
+                    fallback_notice = await reply("🔄 Dynamic media payload missing. Attempting deep structural bypass...")
+                    try:
+                        await user_acc.forward_messages(original_msg.chat.id, chatid, msgid)
+                        await fallback_notice.delete()
+                    except Exception as f_err:
+                        await fallback_notice.edit_text(
+                            f"❌ Protected/Empty Link Bypass Failed.\n"
+                            f"Reason: This link is highly protected, restricted from saving, or empty structural metadata."
+                        )
                 break
 
             # --- Processing Downloader Visualizations ---
             status_msg = await reply("⬇️ Connecting to target user server storage files...")
             
-            # Setup dedicated operational dictionaries for performance contexts
             download_ctx = {"start_time": time.time(), "last_edit": 0.0}
             upload_ctx = {"start_time": time.time(), "last_edit": 0.0}
 
             try:
-                # Download media cleanly with native async callback updates
                 file = await user_acc.download_media(
                     msg, 
                     progress=progress_cb, 
@@ -516,7 +499,6 @@ async def process_single_link(link, original_msg, current=0, total=0):
                     try: thumb = await user_acc.download_media(msg.audio.thumbs[0].file_id)
                     except: pass
 
-                # Reset upload timer reference point explicitly right before uploading starts
                 upload_ctx["start_time"] = time.time()
                 
                 if msg.document:
@@ -552,7 +534,6 @@ async def process_single_link(link, original_msg, current=0, total=0):
 
             except FloodWait as e:
                 await asyncio.sleep(e.value)
-                await reply(f"⚠️ Flood wait limits triggered – retrying same item index after waiting {e.value}s")
                 continue
             except Exception as e:
                 await reply(f"⚠️ Processing pipeline failed on link: {link} – Trace: `{e}`")
@@ -593,7 +574,6 @@ async def process_single_link(link, original_msg, current=0, total=0):
 
             except FloodWait as e:
                 await asyncio.sleep(e.value)
-                await reply(f"⚠️ Flood wait – resuming extraction task in {e.value}s")
                 continue 
             except Exception as e:
                 await reply(f"⚠️ Public parsing operation error: {link} – `{e}`")
@@ -601,4 +581,3 @@ async def process_single_link(link, original_msg, current=0, total=0):
 
 # --------------- Start Application Execution ---------------
 bot.run()
-
