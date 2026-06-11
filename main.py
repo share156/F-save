@@ -2,7 +2,8 @@ import pyrogram
 from pyrogram import Client, filters
 from pyrogram.errors import (
     UserAlreadyParticipant, InviteHashExpired, FloodWait, 
-    PeerIdInvalid, SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired
+    PeerIdInvalid, SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired,
+    ChannelPrivate, UserNotParticipant, ChatForbidden   # added for private chat errors
 )
 from pyrogram.types import Message
 
@@ -349,20 +350,21 @@ async def process_single_link(link, original_msg, current=0, total=0):
             
             try:
                 user_acc = await get_user_client(uid, user_data)
+                if not user_acc:
+                    await reply("❌ Failed to start your session.")
+                    return
             except Exception as e:
                 await reply(f"❌ Failed to fetch user runner session connection: `{e}`")
                 return
             
+            # Attempt to directly gather the message item with expanded error catching
             try:
-                # Attempt to directly gather the message item
                 msg = await user_acc.get_messages(chatid, msgid)
-                
-                # Proactive Self-Healing Routine if Peer Hash is completely unknown to RAM
                 if msg is None:
+                    # Trigger the repair block for missing/null messages
                     raise PeerIdInvalid
-
-            except PeerIdInvalid:
-                # If cache is empty, dynamically force-load dialogue listings to populate hashes
+            except (PeerIdInvalid, ChannelPrivate, UserNotParticipant, ChatForbidden):
+                # Resolve peer cache by forcing dialog list scan
                 status_msg_peer = await reply("🔍 Resolving chat authorization access hashes (first-time setup)...")
                 found = False
                 try:
@@ -373,9 +375,11 @@ async def process_single_link(link, original_msg, current=0, total=0):
                 except Exception as d_err:
                     await status_msg_peer.edit_text(f"⚠️ Failed parsing account dialog directory: `{d_err}`")
                     return
-                
-                try: await status_msg_peer.delete()
-                except: pass
+
+                try:
+                    await status_msg_peer.delete()
+                except Exception:
+                    pass
 
                 if found:
                     try:
@@ -384,10 +388,16 @@ async def process_single_link(link, original_msg, current=0, total=0):
                         await reply(f"❌ Chat verified but message collection failed: `{retry_err}`")
                         return
                 else:
-                    await reply("❌ **Your logged in userbot account is not a member of this private chat group.**\nPlease join the chat first using your profile link.")
+                    await reply(
+                        "❌ **Your logged‑in account is not a member of this private chat.**\n"
+                        "Please join the chat first using an invite link, then send the message link again."
+                    )
                     return
+            except FloodWait as e:
+                await asyncio.sleep(e.value)
+                continue   # retry the loop
             except Exception as e:
-                await reply(f"⚠️ Extraction block error on link: {link} – Trace: `{e}`")
+                await reply(f"⚠️ Unexpected error while fetching message: `{e}`")
                 return
 
             # Validate that the extracted package actually contains target assets
@@ -505,4 +515,3 @@ async def process_single_link(link, original_msg, current=0, total=0):
 
 # --------------- Start Application Execution ---------------
 bot.run()
-
