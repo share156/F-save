@@ -298,7 +298,7 @@ async def handle_text_inputs(client: Client, message: Message):
         return
 
     # 2. Sequential ranges handling
-    range_match = re.match(r'(https://t\.me/(?:c/)?[^/\s]+)/(\d+)\s*-\s*(\d+)$', text)
+    range_match = re.match(r'(https://t\.me/(?:c/)?[^/\s]+)(?:/\d+)?/(\d+)\s*-\s*(\d+)$', text)
     if range_match:
         base_link = range_match.group(1)
         start_id = int(range_match.group(2))
@@ -317,8 +317,8 @@ async def handle_text_inputs(client: Client, message: Message):
             await asyncio.sleep(2)
         return
 
-    # 3. Direct Bulk Link Detections
-    links = re.findall(r'https://t\.me/(?:c/)?[^/\s]+/\d+', text)
+    # 3. Direct Bulk Link Detections (Supports Topic URL formats cleanly)
+    links = re.findall(r'https://t\.me/(?:c/)?[^/\s]+(?:\/\d+)?/\d+', text)
     if not links:
         return
 
@@ -346,7 +346,8 @@ async def process_single_link(link, original_msg, current=0, total=0):
                 await reply("❌ **You have not configured your account parameters yet.**\nUse /login first to handle tracking operations on private chat URLs safely via your own session.")
                 return
 
-            chatid = int("-100" + datas[-2])
+            # Extract chat ID properly even if a topic ID sits in the middle of the link structure
+            chatid = int("-100" + datas[4])
             user_data = USER_SESSIONS[str_uid]
             
             try:
@@ -371,7 +372,6 @@ async def process_single_link(link, original_msg, current=0, total=0):
                 # Now catching both API errors AND local cache missing errors
                 err_text = str(e).lower()
                 
-                # Added 'peer_id_invalid' with underscores and 'message missing'
                 if any(keyword in err_text for keyword in [
                     "peer id invalid", "peer_id_invalid", "channel_private", "user_not_participant",
                     "chat_forbidden", "invalid", "not a member", "no such process", "message missing"
@@ -418,9 +418,24 @@ async def process_single_link(link, original_msg, current=0, total=0):
                 await reply(f"❌ Target item data was missing or not found on server: {link}")
                 return
 
-            if msg.text and not msg.media:
-                await reply(msg.text)
-                break 
+            # Check if there is any actual physical file attached to download (skips link previews safely)
+            has_downloadable_media = any([
+                msg.document, msg.video, msg.animation, 
+                msg.sticker, msg.voice, msg.audio, msg.photo
+            ])
+
+            if not has_downloadable_media:
+                text_to_send = msg.text or msg.caption
+                if text_to_send:
+                    await bot.send_message(
+                        original_msg.chat.id, 
+                        text_to_send, 
+                        entities=msg.entities or msg.caption_entities, 
+                        reply_to_message_id=original_msg.id
+                    )
+                else:
+                    await reply("⚠️ This message does not contain any supported media or text.")
+                break
 
             # --- Processing Downloader Visualizations ---
             status_msg = await reply("⬇️ Connecting to target user server storage files...")
