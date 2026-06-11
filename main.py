@@ -231,9 +231,8 @@ def process_single_link(link, original_msg, current=0, total=0):
                 pass
 
         except FloodWait as e:
-            time.sleep(e.value)
-            reply(f"⚠️ Flood wait – retrying after {e.value}s")
-
+            time.sleep(e.x)
+            reply(f"⚠️ Flood wait – retrying after {e.x}s")
         except Exception as e:
             reply(f"⚠️ Failed: {link} – {e}")
 
@@ -278,9 +277,8 @@ def process_single_link(link, original_msg, current=0, total=0):
                                reply_to_message_id=original_msg.id)
 
         except FloodWait as e:
-            time.sleep(e.value)
-            reply(f"⚠️ Flood wait – retrying after {e.value}s")
-
+            time.sleep(e.x)
+            reply(f"⚠️ Flood wait – retrying after {e.x}s")
         except Exception as e:
             reply(f"⚠️ Failed: {link} – {e}")
 
