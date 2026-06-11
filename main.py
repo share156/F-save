@@ -362,18 +362,19 @@ async def process_single_link(link, original_msg, current=0, total=0):
             try:
                 msg = await user_acc.get_messages(chatid, msgid)
                 if msg is None:
-                    # force the self‑healing block
-                    raise PeerIdInvalid("Message missing")
+                    # Force the self-healing block safely
+                    raise ValueError("message missing")
             except FloodWait as e:
                 await asyncio.sleep(e.value)
                 continue
-            except RPCError as e:
-                # All Telegram API errors (PeerIdInvalid, ChannelPrivate, etc.)
-                err_text = str(e)
-                # Check if the error indicates we don't have access to the chat
-                if any(keyword in err_text.lower() for keyword in [
-                    "peer id invalid", "channel_private", "user_not_participant",
-                    "chat_forbidden", "invalid", "not a member", "no such process"
+            except (RPCError, ValueError) as e:
+                # Now catching both API errors AND local cache missing errors
+                err_text = str(e).lower()
+                
+                # Added 'peer_id_invalid' with underscores and 'message missing'
+                if any(keyword in err_text for keyword in [
+                    "peer id invalid", "peer_id_invalid", "channel_private", "user_not_participant",
+                    "chat_forbidden", "invalid", "not a member", "no such process", "message missing"
                 ]):
                     # Attempt to populate the peer cache by scanning dialogs
                     status_msg_peer = await reply("🔍 Resolving chat authorization access hashes (first-time setup)...")
