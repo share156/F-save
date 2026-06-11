@@ -15,8 +15,6 @@ import re
 from datetime import datetime
 from pymongo import MongoClient
 
-from keep_alive import keep_alive
-
 # --------------- Configuration ---------------
 bot_token = os.environ.get("TOKEN", "")
 api_hash  = os.environ.get("HASH", "")
@@ -58,7 +56,7 @@ ACTIVE_LOGINS  = {}
 CANCEL_BATCH   = {}
 RUNNING_CLIENTS = {}
 
-# Async lock for all shared mutable dictionaries + MongoDB writes
+# Async lock for shared data + MongoDB writes
 data_lock = asyncio.Lock()
 
 DEFAULT_FILTERS = {
@@ -755,7 +753,6 @@ async def handle_text_inputs(client: Client, message: Message):
 
 # --------------- FloodWait Resilient Engine Loop ---------------
 async def process_single_link(link, original_msg, uid=0):
-    # Reset cancellation flag to avoid permanent lock-out from previous runs
     CANCEL_BATCH[uid] = False
 
     datas       = link.split("/")
@@ -948,5 +945,4 @@ async def process_single_link(link, original_msg, uid=0):
 
 # --------------- Start Execution ---------------
 if __name__ == "__main__":
-    keep_alive()
     bot.run()
