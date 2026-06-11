@@ -24,11 +24,12 @@ bot = Client("mybot", api_id=api_id, api_hash=api_hash, bot_token=bot_token)
 # --------------- Local Session Storage ---------------
 SESSION_FILE = "sessions.json"
 USER_SESSIONS = {}
-USER_STATES = {}     # Tracks login conversation states: user_id -> string
-ACTIVE_LOGINS = {}   # Tracks temporary setup clients: user_id -> data dict
+USER_STATES = {}       # Tracks login conversation states: user_id -> string
+ACTIVE_LOGINS = {}     # Tracks temporary setup clients: user_id -> data dict
+CANCEL_BATCH = {}      # TRACKS CANCEL REQUESTS FOR QUEUES: user_id -> bool
 
 # Global live client instances to maintain peer cache & fast connections
-RUNNING_CLIENTS = {} # user_id -> active Client instance
+RUNNING_CLIENTS = {}   # user_id -> active Client instance
 
 def load_sessions():
     global USER_SESSIONS
@@ -128,7 +129,8 @@ async def progress_cb(current, total, status_message, action_text, tracking_ctx)
             f"📊 {bar}\n"
             f"📁 **Size:** {readable_current} / {readable_total}\n"
             f"⚡ **Speed:** {readable_speed}\n"
-            f"⏳ **ETA:** {readable_eta}"
+            f"⏳ **ETA:** {readable_eta}\n\n"
+            f"🛑 Run /cancel to stop processing."
         )
         
         try:
@@ -159,6 +161,9 @@ async def cancel_login(bot: Client, m: Message):
     uid = m.from_user.id
     str_uid = str(uid)
     
+    cancelled_something = False
+
+    # 1. Clear active configuration/state machines
     if str_uid in USER_STATES:
         USER_STATES.pop(str_uid, None)
         if uid in ACTIVE_LOGINS:
@@ -166,9 +171,16 @@ async def cancel_login(bot: Client, m: Message):
                 await ACTIVE_LOGINS[uid]["client"].disconnect()
             except: pass
             ACTIVE_LOGINS.pop(uid, None)
-        await m.reply_text("✅ Ongoing setup operations have been successfully canceled.")
+        cancelled_something = True
+
+    # 2. Trigger global cancel flag for link queues
+    CANCEL_BATCH[uid] = True
+    cancelled_something = True
+
+    if cancelled_something:
+        await m.reply_text("🛑 **Cancel request received.** Halting all login registrations and downloading pipelines instantly.")
     else:
-        await m.reply_text("You do not have any active registration flows currently running.")
+        await m.reply_text("You do not have any operations currently running.")
 
 @bot.on_message(filters.command(["logout"]) & filters.private)
 async def logout_user(bot: Client, m: Message):
@@ -337,6 +349,9 @@ async def handle_text_inputs(client: Client, message: Message):
             await bot.send_message(message.chat.id, f"⚠️ Error joining chat: `{e}`", reply_to_message_id=message.id)
         return
 
+    # Reset cancel flag before spinning up a new queue
+    CANCEL_BATCH[uid] = False
+
     range_match = re.match(r'(https://t\.me/(?:c/)?[^/\s]+)(?:/\d+)?/(\d+)\s*-\s*(\d+)$', text)
     if range_match:
         base_link = range_match.group(1)
@@ -351,6 +366,9 @@ async def handle_text_inputs(client: Client, message: Message):
         await bot.send_message(message.chat.id, f"Processing batch queue extraction: {start_id} → {end_id} ({total} links)")
 
         for msg_id in range(start_id, end_id + 1):
+            if CANCEL_BATCH.get(uid, False):
+                await bot.send_message(message.chat.id, "❌ **Batch sequence cancelled completely.**")
+                break
             link = f"{base_link}/{msg_id}"
             await process_single_link(link, message, current=msg_id - start_id + 1, total=total)
             await asyncio.sleep(2)
@@ -364,6 +382,9 @@ async def handle_text_inputs(client: Client, message: Message):
     await bot.send_message(message.chat.id, f"Found {total} link(s). Initializing parsing queue...", reply_to_message_id=message.id)
 
     for i, link in enumerate(links, start=1):
+        if CANCEL_BATCH.get(uid, False):
+            await bot.send_message(message.chat.id, "❌ **Bulk sequence queue processing stopped.**")
+            break
         await process_single_link(link, message, current=i, total=total)
         await asyncio.sleep(2)
 
@@ -378,6 +399,10 @@ async def process_single_link(link, original_msg, current=0, total=0):
         return await bot.send_message(original_msg.chat.id, text, reply_to_message_id=original_msg.id)
 
     while True:
+        # Emergency check inside the processor engine loop
+        if CANCEL_BATCH.get(uid, False):
+            return
+
         # --- Route 1: Target Link Points to Private Chat Configuration Content ---
         if "https://t.me/c/" in link:
             if str_uid not in USER_SESSIONS:
@@ -413,6 +438,7 @@ async def process_single_link(link, original_msg, current=0, total=0):
                     found = False
                     try:
                         async for dialog in user_acc.get_dialogs():
+                            if CANCEL_BATCH.get(uid, False): break
                             if dialog.chat.id == chatid:
                                 found = True
                                 break
@@ -424,6 +450,8 @@ async def process_single_link(link, original_msg, current=0, total=0):
 
                     try: await status_msg_peer.delete()
                     except: pass
+
+                    if CANCEL_BATCH.get(uid, False): return
 
                     if found:
                         try:
@@ -445,13 +473,11 @@ async def process_single_link(link, original_msg, current=0, total=0):
                 await reply(f"❌ Target item data was missing or not found on server: {link}")
                 return
 
-            # Check if there is any actual physical file attached to download
             has_downloadable_media = any([
                 msg.document, msg.video, msg.animation, 
                 msg.sticker, msg.voice, msg.audio, msg.photo
             ])
 
-            # --- DYNAMIC CRASH RECOVERY FALLBACK ---
             if not has_downloadable_media:
                 text_to_send = msg.text or msg.caption
                 if text_to_send:
@@ -462,8 +488,6 @@ async def process_single_link(link, original_msg, current=0, total=0):
                         reply_to_message_id=original_msg.id
                     )
                 else:
-                    # If it completely fails to identify media but you know a video is there, 
-                    # we trigger an aggressive system-level message copy fallback directly using the userbot string.
                     fallback_notice = await reply("🔄 Dynamic media payload missing. Attempting deep structural bypass...")
                     try:
                         await user_acc.forward_messages(original_msg.chat.id, chatid, msgid)
@@ -474,6 +498,9 @@ async def process_single_link(link, original_msg, current=0, total=0):
                             f"Reason: This link is highly protected, restricted from saving, or empty structural metadata."
                         )
                 break
+
+            # Check cancel flag before downloading files
+            if CANCEL_BATCH.get(uid, False): return
 
             # --- Processing Downloader Visualizations ---
             status_msg = await reply("⬇️ Connecting to target user server storage files...")
@@ -487,6 +514,12 @@ async def process_single_link(link, original_msg, current=0, total=0):
                     progress=progress_cb, 
                     progress_args=(status_msg, f"📥 Downloading message {current}/{total}", download_ctx)
                 )
+
+                if CANCEL_BATCH.get(uid, False):
+                    if file and os.path.exists(file): os.remove(file)
+                    try: await status_msg.delete()
+                    except: pass
+                    return
 
                 thumb = None
                 if msg.document and msg.document.thumbs:
