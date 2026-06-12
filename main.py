@@ -1023,24 +1023,41 @@ async def process_single_link(link: str, original_msg: Message, uid: int = 0) ->
                 except: pass
 
 # ─────────────────────────────────────────────
-# Entry point (hard timeout on data loading)
+# Entry point (Hard timeout and validation safeguards)
 # ─────────────────────────────────────────────
 async def main():
-    try:
-        await asyncio.wait_for(load_all_data(), timeout=10)
-    except asyncio.TimeoutError:
-        print("⚠️ MongoDB loading timed out – starting with empty caches.")
-    except Exception as e:
-        print(f"❌ Data load error: {e}")
-
-    try:
-        await bot.start()
-        print("✅ Bot is running…")
-    except Exception as e:
-        print(f"❌ FATAL — Bot failed to start: {e}")
+    # 1. Environment Verification Guardrail
+    if not api_id or not api_hash or not bot_token:
+        print("❌ FATAL ERROR: Missing critical credentials in your environment variables.")
+        print(f"DEBUG STATUS -> ID: {'PROCESSED' if api_id else 'MISSING/ZERO'}, "
+              f"HASH: {'PROCESSED' if api_hash else 'MISSING'}, "
+              f"TOKEN: {'PROCESSED' if bot_token else 'MISSING'}")
+        print("💡 Action: Ensure variables 'ID', 'HASH', and 'TOKEN' are properly configured on your dashboard.")
         return
 
+    # 2. Asynchronous Persistence Loading Phase
+    print("🔄 Initializing data loading step...")
+    try:
+        await asyncio.wait_for(load_all_data(), timeout=10)
+        print("✅ Database caches synchronized successfully.")
+    except asyncio.TimeoutError:
+        print("⚠️ MongoDB loading step timed out – starting process with empty structural caches.")
+    except Exception as e:
+        print(f"❌ Structural data initialization error: {e}")
+
+    # 3. Pyrogram Connection Hook
+    print("🔄 Injecting credentials into client and establishing handshake...")
+    try:
+        await bot.start()
+        print("✅ Bot is running successfully!")
+    except Exception as e:
+        print(f"❌ FATAL ERROR — Telethon/Pyrogram client failed initialization: {e}")
+        print("💡 Hint: If it hangs indefinitely here during testing, check for background terminal tasks or invalid credentials.")
+        return
+
+    # Keep loop running smoothly
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
+
