@@ -577,7 +577,14 @@ async def cmd_cancel(_bot: Client, m: Message) -> None:
 # ─────────────────────────────────────────────
 # Text & Media Link Dispatcher (Group 1 - Content Processor)
 # ─────────────────────────────────────────────
-@bot.on_message((filters.text | filters.caption | filters.photo) & ~filters.command, group=1)
+
+# Custom filter function to exclude any messages beginning with command slashes '/'
+def exclude_commands_filter(_, __, m: Message):
+    return not (m.text or m.caption or "").startswith("/")
+
+not_command = filters.create(exclude_commands_filter)
+
+@bot.on_message((filters.text | filters.caption | filters.photo) & not_command, group=1)
 async def handle_text_inputs(client: Client, message: Message) -> None:
     uid     = message.from_user.id if message.from_user else message.chat.id
     str_uid = str(uid)
