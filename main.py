@@ -205,7 +205,7 @@ async def remove_subscriber(bot: Client, m: Message):
 # --------------- Interactive Callback Queries Engine ---------------
 @bot.on_callback_query()
 async def handle_settings_callbacks(client: Client, cb: CallbackQuery):
-    try: await cb.answer()
+    try: await cb.answer() # <-- FIX: Prevents the button from spinning forever
     except: pass
 
     uid_str = str(cb.from_user.id)
@@ -331,9 +331,9 @@ async def handle_text_inputs(client: Client, message: Message):
     str_uid = str(user_id)
     text = (message.text or message.caption or "").strip()
 
-    if text.startswith("/"): return
+    if text.startswith("/"): return # Base commands handled elsewhere
 
-    # --- STATE ROUTING ---
+    # --- STATE ROUTING (Fix: Added returns to stop bleeding) ---
     if str_uid in USER_STATES and message.chat.type == pyrogram.enums.ChatType.PRIVATE:
         state = USER_STATES[str_uid]
         config = init_user_config(str_uid)
@@ -418,9 +418,6 @@ async def handle_text_inputs(client: Client, message: Message):
     if range_match:
         base_link, start_id, end_id = range_match.group(1), int(range_match.group(2)), int(range_match.group(3))
         if end_id < start_id: return
-        total = end_id - start_id + 1
-        # ➕ NEW: batch progress message
-        await message.reply_text(f"📦 Processing batch queue extraction: {start_id} → {end_id} ({total} links)")
         for msg_id in range(start_id, end_id + 1):
             if CANCEL_BATCH.get(user_id, False): break
             await process_single_link(f"{base_link}/{msg_id}", message, uid=user_id)
@@ -433,7 +430,7 @@ async def handle_text_inputs(client: Client, message: Message):
         await process_single_link(link, message, uid=user_id)
         await asyncio.sleep(2)
 
-# --------------- Engine Loop Processor ---------------
+# --------------- Engine Loop Processor (Robust FloodWait Resilient) ---------------
 async def process_single_link(link, original_msg, uid=0):
     datas = link.split("/")
     msgid = int(datas[-1])
@@ -498,9 +495,6 @@ async def process_single_link(link, original_msg, uid=0):
                 record_processed_history(str_uid, f"{username}_{msgid}")
                 break 
 
-        except PeerIdInvalid:
-            await reply("⚠️ You do not have access to this chat. Make sure your account is a member of the chat/channel.")
-            break
         except FloodWait as e:
             await reply(f"⏳ **Rate Limit (FloodWait)**\nPausing for `{e.value + 2}s` and retrying...")
             await asyncio.sleep(e.value + 2)
@@ -518,4 +512,7 @@ async def process_single_link(link, original_msg, uid=0):
                 except: pass
 
 if __name__ == "__main__":
+    from keep_alive import keep_alive # Assuming you still have keep_alive.py
+    keep_alive()
     bot.run()
+
