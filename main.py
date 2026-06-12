@@ -518,6 +518,4 @@ async def process_single_link(link, original_msg, uid=0):
                 except: pass
 
 if __name__ == "__main__":
-    from keep_alive import keep_alive
-    keep_alive()
     bot.run()
