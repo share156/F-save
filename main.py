@@ -1,5 +1,5 @@
 import pyrogram
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.errors import (
     UserAlreadyParticipant, InviteHashExpired, FloodWait,
     PeerIdInvalid, SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired,
@@ -37,7 +37,7 @@ USE_MONGO = bool(MONGO_URI)
 print(f"✅ Using {'MongoDB' if USE_MONGO else 'JSON files'} for persistence.")
 
 # ─────────────────────────────────────────────
-# Database setup (short timeouts so the bot never hangs)
+# Database setup
 # ─────────────────────────────────────────────
 if USE_MONGO:
     mongo_client = MongoClient(
@@ -156,39 +156,33 @@ async def load_all_data():
                         globals()[name] = await _read_json(path)
                     except Exception as e: print(f"⚠️ Could not load {path}: {e}")
 
-# Save functions — no lock inside (caller holds data_lock)
 async def save_sessions():
     if USE_MONGO:
-        await _sync_to_async(sessions_col.update_one,
-            {"_id": "sessions"}, {"$set": {"data": USER_SESSIONS}}, upsert=True)
+        await _sync_to_async(sessions_col.update_one, {"_id": "sessions"}, {"$set": {"data": USER_SESSIONS}}, upsert=True)
     else:
         await _write_json(SESSION_FILE, USER_SESSIONS)
 
 async def save_authorized_users():
     if USE_MONGO:
-        await _sync_to_async(auth_col.update_one,
-            {"_id": "auth"}, {"$set": {"data": AUTHORIZED_USERS}}, upsert=True)
+        await _sync_to_async(auth_col.update_one, {"_id": "auth"}, {"$set": {"data": AUTHORIZED_USERS}}, upsert=True)
     else:
         await _write_json(AUTH_FILE, AUTHORIZED_USERS)
 
 async def save_user_settings():
     if USE_MONGO:
-        await _sync_to_async(settings_col.update_one,
-            {"_id": "settings"}, {"$set": {"data": USER_SETTINGS}}, upsert=True)
+        await _sync_to_async(settings_col.update_one, {"_id": "settings"}, {"$set": {"data": USER_SETTINGS}}, upsert=True)
     else:
         await _write_json(SETTINGS_FILE, USER_SETTINGS)
 
 async def save_history():
     if USE_MONGO:
-        await _sync_to_async(history_col.update_one,
-            {"_id": "history"}, {"$set": {"data": PROCESSED_HISTORY}}, upsert=True)
+        await _sync_to_async(history_col.update_one, {"_id": "history"}, {"$set": {"data": PROCESSED_HISTORY}}, upsert=True)
     else:
         await _write_json(HISTORY_FILE, PROCESSED_HISTORY)
 
 async def save_daily_usage():
     if USE_MONGO:
-        await _sync_to_async(daily_usage_col.update_one,
-            {"_id": "daily_usage"}, {"$set": {"data": DAILY_PUBLIC_USAGE}}, upsert=True)
+        await _sync_to_async(daily_usage_col.update_one, {"_id": "daily_usage"}, {"$set": {"data": DAILY_PUBLIC_USAGE}}, upsert=True)
     else:
         await _write_json(DAILY_USAGE_FILE, DAILY_PUBLIC_USAGE)
 
@@ -302,9 +296,9 @@ def _build_thumb_menu(config: dict):
     return text, kb
 
 # ─────────────────────────────────────────────
-# Admin commands
+# Admin commands (Group 0)
 # ─────────────────────────────────────────────
-@bot.on_message(filters.command(["adduser"]) & filters.user(ADMIN_ID))
+@bot.on_message(filters.command(["adduser"]) & filters.user(ADMIN_ID), group=0)
 async def add_subscriber(_bot: Client, m: Message) -> None:
     if len(m.command) < 3:
         await m.reply_text("Usage: `/adduser <user_id> <duration>` (e.g. `30d`, `12h`, `60m`)")
@@ -323,7 +317,7 @@ async def add_subscriber(_bot: Client, m: Message) -> None:
         await save_authorized_users()
     await m.reply_text(f"✅ Subscriber added: `{target_id}` for `{m.command[2]}`")
 
-@bot.on_message(filters.command(["remuser"]) & filters.user(ADMIN_ID))
+@bot.on_message(filters.command(["remuser"]) & filters.user(ADMIN_ID), group=0)
 async def remove_subscriber(_bot: Client, m: Message) -> None:
     if len(m.command) < 2:
         return
@@ -342,8 +336,7 @@ async def handle_settings_callbacks(client: Client, cb: CallbackQuery) -> None:
     config  = init_user_config(uid_str)
 
     if data == "menu_main":
-        await cb.message.edit_text("⚙️ **Main Custom Output Settings Panel**",
-                                   reply_markup=get_main_settings_keyboard())
+        await cb.message.edit_text("⚙️ **Main Custom Output Settings Panel**", reply_markup=get_main_settings_keyboard())
     elif data == "menu_caption":
         txt, kb = _build_caption_menu(config)
         await cb.message.edit_text(txt, reply_markup=kb)
@@ -369,11 +362,9 @@ async def handle_settings_callbacks(client: Client, cb: CallbackQuery) -> None:
         USER_STATES[uid_str] = "SETTING_THUMBNAIL"
         await cb.message.reply_text("🖼️ Send a photo to use as the thumbnail:")
     elif data == "menu_filters_page1":
-        await cb.message.edit_text("⭐ **Content Filtering — Page 1**",
-                                   reply_markup=get_filters_page1_keyboard(uid_str))
+        await cb.message.edit_text("⭐ **Content Filtering — Page 1**", reply_markup=get_filters_page1_keyboard(uid_str))
     elif data == "menu_filters_page2":
-        await cb.message.edit_text("⚙️ **Advanced Filtering — Page 2**",
-                                   reply_markup=get_filters_page2_keyboard(uid_str))
+        await cb.message.edit_text("⚙️ **Advanced Filtering — Page 2**", reply_markup=get_filters_page2_keyboard(uid_str))
     elif data.startswith("f1_toggle:") or data.startswith("f2_toggle:"):
         key = data.split(":")[1]
         async with data_lock:
@@ -419,8 +410,7 @@ def passed_content_filters(uid_str: str, msg: Message, context: str) -> bool:
     keywords = cfg.get("keywords", [])
     if keywords and not any(kw.strip().lower() in msg_text for kw in keywords if kw.strip()):
         return False
-    is_text_only = not any([msg.document, msg.video, msg.photo, msg.audio,
-                            msg.voice, msg.animation, msg.sticker, msg.poll])
+    is_text_only = not any([msg.document, msg.video, msg.photo, msg.audio, msg.voice, msg.animation, msg.sticker, msg.poll])
     if is_text_only and not cfg.get("text", True):       return False
     if msg.document  and not cfg.get("document", True):  return False
     if msg.video     and not cfg.get("video", True):     return False
@@ -517,9 +507,9 @@ async def progress_cb(current, total, status_msg, action_text, ctx, uid) -> None
             pass
 
 # ─────────────────────────────────────────────
-# Public commands (no subscription filter)
+# Command Handlers (Group 0 - High Priority)
 # ─────────────────────────────────────────────
-@bot.on_message(filters.command(["start"]))
+@bot.on_message(filters.command(["start"]), group=0)
 async def cmd_start(_bot: Client, m: Message) -> None:
     await m.reply_text(
         "**Welcome!**\n\n"
@@ -531,7 +521,7 @@ async def cmd_start(_bot: Client, m: Message) -> None:
         f"ℹ️ You can extract **{MAX_DAILY_PUBLIC_LINKS} public links per day**. Private channels require a linked account."
     )
 
-@bot.on_message(filters.command(["login"]) & filters.private)
+@bot.on_message(filters.command(["login"]) & filters.private, group=0)
 async def cmd_login(_bot: Client, m: Message) -> None:
     str_uid = str(m.from_user.id)
     if str_uid in USER_SESSIONS:
@@ -540,7 +530,7 @@ async def cmd_login(_bot: Client, m: Message) -> None:
     USER_STATES[str_uid] = "WAITING_API_ID"
     await m.reply_text("🔑 Send your **API ID** (numeric, from my.telegram.org/apps):")
 
-@bot.on_message(filters.command(["logout"]) & filters.private)
+@bot.on_message(filters.command(["logout"]) & filters.private, group=0)
 async def cmd_logout(_bot: Client, m: Message) -> None:
     uid     = m.from_user.id
     str_uid = str(uid)
@@ -558,7 +548,7 @@ async def cmd_logout(_bot: Client, m: Message) -> None:
     USER_STATES.pop(str_uid, None)
     await m.reply_text("✅ Session removed successfully.")
 
-@bot.on_message(filters.command(["status"]) & filters.private)
+@bot.on_message(filters.command(["status"]) & filters.private, group=0)
 async def cmd_status(_bot: Client, m: Message) -> None:
     uid     = m.from_user.id
     str_uid = str(uid)
@@ -568,18 +558,16 @@ async def cmd_status(_bot: Client, m: Message) -> None:
         daily_count = entry["count"]
     else:
         daily_count = 0
-    remaining = max(0, MAX_DAILY_PUBLIC_LINKS - daily_count)
     usage_msg = f"📆 Public links today: {daily_count}/{MAX_DAILY_PUBLIC_LINKS} (resets at 00:00 UTC)"
     session_ok = "✅ Linked" if str_uid in USER_SESSIONS else "❌ Not linked"
     await m.reply_text(f"📊 **Account Status**\n\n{usage_msg}\n🔹 Session: {session_ok}")
 
-@bot.on_message(filters.command(["settings"]) & filters.private)
+@bot.on_message(filters.command(["settings"]) & filters.private, group=0)
 async def cmd_settings(_bot: Client, m: Message) -> None:
     init_user_config(str(m.from_user.id))
-    await m.reply_text("⚙️ **Main Custom Output Settings Panel**",
-                       reply_markup=get_main_settings_keyboard())
+    await m.reply_text("⚙️ **Main Custom Output Settings Panel**", reply_markup=get_main_settings_keyboard())
 
-@bot.on_message(filters.command(["cancel"]))
+@bot.on_message(filters.command(["cancel"]), group=0)
 async def cmd_cancel(_bot: Client, m: Message) -> None:
     uid = m.from_user.id if m.from_user else m.chat.id
     USER_STATES.pop(str(uid), None)
@@ -587,20 +575,15 @@ async def cmd_cancel(_bot: Client, m: Message) -> None:
     await m.reply_text("🛑 All sequences stopped.")
 
 # ─────────────────────────────────────────────
-# Conversation & link dispatcher
+# Text & Media Link Dispatcher (Group 1 - Content Processor)
 # ─────────────────────────────────────────────
-@bot.on_message((filters.text | filters.caption | filters.photo))
+@bot.on_message((filters.text | filters.caption | filters.photo) & ~filters.command, group=1)
 async def handle_text_inputs(client: Client, message: Message) -> None:
     uid     = message.from_user.id if message.from_user else message.chat.id
     str_uid = str(uid)
     text    = (message.text or message.caption or "").strip()
 
-    if text.startswith("/"):
-        cmd = text.split()[0].split("@")[0]
-        if cmd in ("/start", "/login", "/logout", "/cancel", "/adduser", "/remuser", "/status", "/settings"):
-            return
-
-    # State machine
+    # Conversation State Machine
     if str_uid in USER_STATES and message.chat.type == pyrogram.enums.ChatType.PRIVATE:
         state  = USER_STATES[str_uid]
         config = init_user_config(str_uid)
@@ -628,8 +611,7 @@ async def handle_text_inputs(client: Client, message: Message) -> None:
         elif state == "SETTING_SIZE_LIMIT":
             try:
                 size = int(text)
-                if size < 0:
-                    raise ValueError
+                if size < 0: raise ValueError
                 async with data_lock:
                     config["filters"]["size_limit"] = size
                     await save_user_settings()
@@ -646,9 +628,7 @@ async def handle_text_inputs(client: Client, message: Message) -> None:
                     await save_user_settings()
             else:
                 async with data_lock:
-                    config["filters"]["extensions"] = [
-                        e.strip().lower().lstrip(".") for e in text.split() if e.strip()
-                    ]
+                    config["filters"]["extensions"] = [e.strip().lower().lstrip(".") for e in text.split() if e.strip()]
                     await save_user_settings()
             USER_STATES.pop(str_uid, None)
             await message.reply_text("✅ Extensions updated.")
@@ -660,15 +640,13 @@ async def handle_text_inputs(client: Client, message: Message) -> None:
                     await save_user_settings()
             else:
                 async with data_lock:
-                    config["filters"]["keywords"] = [
-                        k.strip() for k in text.split(",") if k.strip()
-                    ]
+                    config["filters"]["keywords"] = [k.strip() for k in text.split(",") if k.strip()]
                     await save_user_settings()
             USER_STATES.pop(str_uid, None)
             await message.reply_text("✅ Keywords updated.")
             return
 
-        # Login states
+        # Account login flow
         if state == "WAITING_API_ID":
             if not text.isdigit():
                 await message.reply_text("❌ API ID must be a number. Try again:")
@@ -694,12 +672,7 @@ async def handle_text_inputs(client: Client, message: Message) -> None:
             ACTIVE_LOGINS[uid]["phone"] = text
             temp_client = None
             try:
-                temp_client = Client(
-                    name=f"login_{uid}",
-                    api_id=ACTIVE_LOGINS[uid]["api_id"],
-                    api_hash=ACTIVE_LOGINS[uid]["api_hash"],
-                    in_memory=True,
-                )
+                temp_client = Client(name=f"login_{uid}", api_id=ACTIVE_LOGINS[uid]["api_id"], api_hash=ACTIVE_LOGINS[uid]["api_hash"], in_memory=True)
                 await temp_client.connect()
                 code_info = await temp_client.send_code(text)
                 ACTIVE_LOGINS[uid]["client"]          = temp_client
@@ -721,18 +694,10 @@ async def handle_text_inputs(client: Client, message: Message) -> None:
                 await message.reply_text("❌ Session expired. Use /login again.")
                 return
             try:
-                await login_data["client"].sign_in(
-                    phone_number=login_data["phone"],
-                    phone_code_hash=login_data["phone_code_hash"],
-                    phone_code=text.replace(" ", ""),
-                )
+                await login_data["client"].sign_in(phone_number=login_data["phone"], phone_code_hash=login_data["phone_code_hash"], phone_code=text.replace(" ", ""))
                 session_str = await login_data["client"].export_session_string()
                 async with data_lock:
-                    USER_SESSIONS[str_uid] = {
-                        "api_id":         login_data["api_id"],
-                        "api_hash":       login_data["api_hash"],
-                        "session_string": session_str,
-                    }
+                    USER_SESSIONS[str_uid] = {"api_id": login_data["api_id"], "api_hash": login_data["api_hash"], "session_string": session_str}
                     await save_sessions()
                 USER_STATES.pop(str_uid, None)
                 ACTIVE_LOGINS.pop(uid, None)
@@ -757,11 +722,7 @@ async def handle_text_inputs(client: Client, message: Message) -> None:
                 await login_data["client"].check_password(password=text)
                 session_str = await login_data["client"].export_session_string()
                 async with data_lock:
-                    USER_SESSIONS[str_uid] = {
-                        "api_id":         login_data["api_id"],
-                        "api_hash":       login_data["api_hash"],
-                        "session_string": session_str,
-                    }
+                    USER_SESSIONS[str_uid] = {"api_id": login_data["api_id"], "api_hash": login_data["api_hash"], "session_string": session_str}
                     await save_sessions()
                 USER_STATES.pop(str_uid, None)
                 ACTIVE_LOGINS.pop(uid, None)
@@ -773,7 +734,7 @@ async def handle_text_inputs(client: Client, message: Message) -> None:
     if not text:
         return
 
-    # Join links
+    # Invitation Link Handlers
     if "https://t.me/+" in text or "https://t.me/joinchat/" in text:
         if str_uid not in USER_SESSIONS:
             await message.reply_text("❌ You need to /login first to join chats.")
@@ -788,24 +749,22 @@ async def handle_text_inputs(client: Client, message: Message) -> None:
 
     CANCEL_BATCH[uid] = False
 
+    # Process structured link blocks
     range_match = re.match(r"(https://t\.me/(?:c/)?[^/\s]+)(?:/\d+)?/(\d+)\s*-\s*(\d+)$", text)
     if range_match:
         base  = range_match.group(1)
         start = int(range_match.group(2))
         end   = int(range_match.group(3))
-        if end < start:
-            return
+        if end < start: return
         for msg_id in range(start, end + 1):
-            if CANCEL_BATCH.get(uid, False):
-                break
+            if CANCEL_BATCH.get(uid, False): break
             await process_single_link(f"{base}/{msg_id}", message, uid=uid)
             await asyncio.sleep(2)
         return
 
     links = re.findall(r"https://t\.me/(?:c/)?[^/\s]+(?:\/\d+)?/\d+", text)
     for link in links:
-        if CANCEL_BATCH.get(uid, False):
-            break
+        if CANCEL_BATCH.get(uid, False): break
         await process_single_link(link, message, uid=uid)
         await asyncio.sleep(2)
 
@@ -849,32 +808,25 @@ async def process_single_link(link: str, original_msg: Message, uid: int = 0) ->
                 chatid   = int("-100" + parts[4])
                 user_acc = await get_user_client(uid, USER_SESSIONS[str_uid])
                 msg      = await user_acc.get_messages(chatid, msgid)
-                if not msg:
-                    break
-                if not passed_content_filters(str_uid, msg, f"{chatid}_{msgid}"):
-                    break
+                if not msg: break
+                if not passed_content_filters(str_uid, msg, f"{chatid}_{msgid}"): break
 
                 if frules.get("forward_tag", False):
                     try:
                         await user_acc.forward_messages(original_msg.chat.id, chatid, msgid)
                         await record_history(str_uid, f"{chatid}_{msgid}")
                         break
-                    except FloodWait as exc:
-                        raise exc
-                    except:
-                        pass
+                    except FloodWait as exc: raise exc
+                    except: pass
 
-                has_media      = any([msg.document, msg.video, msg.animation,
-                                      msg.sticker, msg.voice, msg.audio, msg.photo])
+                has_media      = any([msg.document, msg.video, msg.animation, msg.sticker, msg.voice, msg.audio, msg.photo])
                 final_cap      = user_cfg["caption"] if user_cfg["use_caption"] else (msg.caption or "")
                 final_entities = None if user_cfg["use_caption"] else (msg.caption_entities or msg.entities)
 
                 if not has_media:
                     txt_out = user_cfg["caption"] if user_cfg["use_caption"] else (msg.text or msg.caption)
                     if txt_out:
-                        await bot.send_message(original_msg.chat.id, txt_out,
-                                               entities=final_entities,
-                                               reply_to_message_id=original_msg.id)
+                        await bot.send_message(original_msg.chat.id, txt_out, entities=final_entities, reply_to_message_id=original_msg.id)
                         await record_history(str_uid, f"{chatid}_{msgid}")
                     break
 
@@ -882,10 +834,7 @@ async def process_single_link(link: str, original_msg: Message, uid: int = 0) ->
                 dl_ctx = {"start_time": time.time(), "last_edit": 0.0}
                 up_ctx = {"start_time": time.time(), "last_edit": 0.0}
 
-                file = await user_acc.download_media(
-                    msg, progress=progress_cb,
-                    progress_args=(status_msg, "📥 Downloading", dl_ctx, uid),
-                )
+                file = await user_acc.download_media(msg, progress=progress_cb, progress_args=(status_msg, "📥 Downloading", dl_ctx, uid))
 
                 if user_cfg["use_thumb"] and user_cfg["thumb"]:
                     try: thumb = await bot.download_media(user_cfg["thumb"])
@@ -897,52 +846,28 @@ async def process_single_link(link: str, original_msg: Message, uid: int = 0) ->
                         except: pass
 
                 if msg.document:
-                    await bot.send_document(
-                        original_msg.chat.id, file, thumb=thumb,
-                        caption=final_cap, caption_entities=final_entities,
-                        reply_to_message_id=original_msg.id,
-                        progress=progress_cb,
-                        progress_args=(status_msg, "📤 Uploading Document", up_ctx, uid),
-                    )
+                    await bot.send_document(original_msg.chat.id, file, thumb=thumb, caption=final_cap, caption_entities=final_entities, reply_to_message_id=original_msg.id, progress=progress_cb, progress_args=(status_msg, "📤 Uploading Document", up_ctx, uid))
                 elif msg.video:
-                    await bot.send_video(
-                        original_msg.chat.id, file,
-                        duration=msg.video.duration, width=msg.video.width, height=msg.video.height,
-                        thumb=thumb, caption=final_cap, caption_entities=final_entities,
-                        reply_to_message_id=original_msg.id,
-                        progress=progress_cb,
-                        progress_args=(status_msg, "📤 Uploading Video", up_ctx, uid),
-                    )
+                    await bot.send_video(original_msg.chat.id, file, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=thumb, caption=final_cap, caption_entities=final_entities, reply_to_message_id=original_msg.id, progress=progress_cb, progress_args=(status_msg, "📤 Uploading Video", up_ctx, uid))
                 elif msg.photo:
-                    await bot.send_photo(original_msg.chat.id, file,
-                                         caption=final_cap, caption_entities=final_entities,
-                                         reply_to_message_id=original_msg.id)
+                    await bot.send_photo(original_msg.chat.id, file, caption=final_cap, caption_entities=final_entities, reply_to_message_id=original_msg.id)
                 elif msg.audio:
-                    await bot.send_audio(original_msg.chat.id, file,
-                                         caption=final_cap, caption_entities=final_entities,
-                                         reply_to_message_id=original_msg.id)
+                    await bot.send_audio(original_msg.chat.id, file, caption=final_cap, caption_entities=final_entities, reply_to_message_id=original_msg.id)
                 elif msg.voice:
-                    await bot.send_voice(original_msg.chat.id, file,
-                                         caption=final_cap, caption_entities=final_entities,
-                                         reply_to_message_id=original_msg.id)
+                    await bot.send_voice(original_msg.chat.id, file, caption=final_cap, caption_entities=final_entities, reply_to_message_id=original_msg.id)
                 elif msg.animation:
-                    await bot.send_animation(original_msg.chat.id, file,
-                                             caption=final_cap, caption_entities=final_entities,
-                                             reply_to_message_id=original_msg.id)
+                    await bot.send_animation(original_msg.chat.id, file, caption=final_cap, caption_entities=final_entities, reply_to_message_id=original_msg.id)
                 elif msg.sticker:
-                    await bot.send_sticker(original_msg.chat.id, file,
-                                           reply_to_message_id=original_msg.id)
+                    await bot.send_sticker(original_msg.chat.id, file, reply_to_message_id=original_msg.id)
 
                 await record_history(str_uid, f"{chatid}_{msgid}")
                 break
 
-            else:   # public
+            else:   # Public Link Parser
                 username = parts[-2]
                 msg = await bot.get_messages(username, msgid)
-                if not msg:
-                    break
-                if not passed_content_filters(str_uid, msg, f"{username}_{msgid}"):
-                    break
+                if not msg: break
+                if not passed_content_filters(str_uid, msg, f"{username}_{msgid}"): break
 
                 if frules.get("forward_tag", False):
                     await bot.forward_messages(original_msg.chat.id, username, msgid)
@@ -959,45 +884,28 @@ async def process_single_link(link: str, original_msg: Message, uid: int = 0) ->
                 if msg.document:
                     if pub_thumb:
                         file = await bot.download_media(msg)
-                        await bot.send_document(original_msg.chat.id, file, thumb=pub_thumb,
-                                                caption=final_cap, caption_entities=final_entities,
-                                                reply_to_message_id=original_msg.id)
+                        await bot.send_document(original_msg.chat.id, file, thumb=pub_thumb, caption=final_cap, caption_entities=final_entities, reply_to_message_id=original_msg.id)
                     else:
-                        await bot.send_document(original_msg.chat.id, msg.document.file_id,
-                                                caption=final_cap, caption_entities=final_entities,
-                                                reply_to_message_id=original_msg.id)
+                        await bot.send_document(original_msg.chat.id, msg.document.file_id, caption=final_cap, caption_entities=final_entities, reply_to_message_id=original_msg.id)
                 elif msg.video:
                     if pub_thumb:
                         file = await bot.download_media(msg)
-                        await bot.send_video(original_msg.chat.id, file, thumb=pub_thumb,
-                                             caption=final_cap, caption_entities=final_entities,
-                                             reply_to_message_id=original_msg.id)
+                        await bot.send_video(original_msg.chat.id, file, thumb=pub_thumb, caption=final_cap, caption_entities=final_entities, reply_to_message_id=original_msg.id)
                     else:
-                        await bot.send_video(original_msg.chat.id, msg.video.file_id,
-                                             caption=final_cap, caption_entities=final_entities,
-                                             reply_to_message_id=original_msg.id)
+                        await bot.send_video(original_msg.chat.id, msg.video.file_id, caption=final_cap, caption_entities=final_entities, reply_to_message_id=original_msg.id)
                 elif msg.photo:
-                    await bot.send_photo(original_msg.chat.id, msg.photo.file_id,
-                                         caption=final_cap, caption_entities=final_entities,
-                                         reply_to_message_id=original_msg.id)
+                    await bot.send_photo(original_msg.chat.id, msg.photo.file_id, caption=final_cap, caption_entities=final_entities, reply_to_message_id=original_msg.id)
                 elif msg.audio:
-                    await bot.send_audio(original_msg.chat.id, msg.audio.file_id,
-                                         caption=final_cap, caption_entities=final_entities,
-                                         reply_to_message_id=original_msg.id)
+                    await bot.send_audio(original_msg.chat.id, msg.audio.file_id, caption=final_cap, caption_entities=final_entities, reply_to_message_id=original_msg.id)
                 elif msg.voice:
-                    await bot.send_voice(original_msg.chat.id, msg.voice.file_id,
-                                         caption=final_cap, reply_to_message_id=original_msg.id)
+                    await bot.send_voice(original_msg.chat.id, msg.voice.file_id, caption=final_cap, reply_to_message_id=original_msg.id)
                 elif msg.animation:
-                    await bot.send_animation(original_msg.chat.id, msg.animation.file_id,
-                                             caption=final_cap, caption_entities=final_entities,
-                                             reply_to_message_id=original_msg.id)
+                    await bot.send_animation(original_msg.chat.id, msg.animation.file_id, caption=final_cap, caption_entities=final_entities, reply_to_message_id=original_msg.id)
                 elif msg.sticker:
-                    await bot.send_sticker(original_msg.chat.id, msg.sticker.file_id,
-                                           reply_to_message_id=original_msg.id)
+                    await bot.send_sticker(original_msg.chat.id, msg.sticker.file_id, reply_to_message_id=original_msg.id)
                 elif msg.text:
                     send_text = user_cfg["caption"] if user_cfg["use_caption"] else msg.text
-                    await bot.send_message(original_msg.chat.id, send_text,
-                                           entities=final_entities, reply_to_message_id=original_msg.id)
+                    await bot.send_message(original_msg.chat.id, send_text, entities=final_entities, reply_to_message_id=original_msg.id)
 
                 await record_history(str_uid, f"{username}_{msgid}")
                 break
@@ -1023,19 +931,13 @@ async def process_single_link(link: str, original_msg: Message, uid: int = 0) ->
                 except: pass
 
 # ─────────────────────────────────────────────
-# Entry point (Hard timeout and validation safeguards)
+# Entry point
 # ─────────────────────────────────────────────
 async def main():
-    # 1. Environment Verification Guardrail
     if not api_id or not api_hash or not bot_token:
         print("❌ FATAL ERROR: Missing critical credentials in your environment variables.")
-        print(f"DEBUG STATUS -> ID: {'PROCESSED' if api_id else 'MISSING/ZERO'}, "
-              f"HASH: {'PROCESSED' if api_hash else 'MISSING'}, "
-              f"TOKEN: {'PROCESSED' if bot_token else 'MISSING'}")
-        print("💡 Action: Ensure variables 'ID', 'HASH', and 'TOKEN' are properly configured on your dashboard.")
         return
 
-    # 2. Asynchronous Persistence Loading Phase
     print("🔄 Initializing data loading step...")
     try:
         await asyncio.wait_for(load_all_data(), timeout=10)
@@ -1045,18 +947,17 @@ async def main():
     except Exception as e:
         print(f"❌ Structural data initialization error: {e}")
 
-    # 3. Pyrogram Connection Hook
     print("🔄 Injecting credentials into client and establishing handshake...")
     try:
         await bot.start()
         print("✅ Bot is running successfully!")
+        
+        # Using Pyrogram's idle to catch signals and safely loop incoming tasks
+        await idle()
+        await bot.stop()
     except Exception as e:
         print(f"❌ FATAL ERROR — Telethon/Pyrogram client failed initialization: {e}")
-        print("💡 Hint: If it hangs indefinitely here during testing, check for background terminal tasks or invalid credentials.")
         return
-
-    # Keep loop running smoothly
-    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
