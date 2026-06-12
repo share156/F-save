@@ -40,7 +40,6 @@ print(f"✅ Using {'MongoDB' if USE_MONGO else 'JSON files'} for persistence.")
 # Database setup
 # ─────────────────────────────────────────────
 if USE_MONGO:
-    # 5‑second timeout so the bot doesn't hang if the DB is unreachable
     mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
     db = mongo_client["telegram_bot_db"]
     sessions_col = db["sessions"]
@@ -49,7 +48,6 @@ if USE_MONGO:
     history_col  = db["history"]
     daily_usage_col = db["daily_usage"]
 else:
-    # JSON fallback paths
     SESSION_FILE   = "sessions.json"
     AUTH_FILE      = "authorized_users.json"
     SETTINGS_FILE  = "user_settings.json"
@@ -100,7 +98,6 @@ class DownloadCancelled(Exception):
 # Async-safe persistence helpers
 # ─────────────────────────────────────────────
 async def _sync_to_async(func, *args, **kwargs):
-    """Run a synchronous pymongo call in a thread."""
     return await asyncio.to_thread(func, *args, **kwargs)
 
 async def _read_json(path):
@@ -119,34 +116,27 @@ async def load_all_data():
     global USER_SESSIONS, AUTHORIZED_USERS, USER_SETTINGS, PROCESSED_HISTORY, DAILY_PUBLIC_USAGE
     async with data_lock:
         if USE_MONGO:
-            # MongoDB loading – if any call fails, we keep empty dicts and warn
             try:
                 s = await _sync_to_async(sessions_col.find_one, {"_id": "sessions"})
                 USER_SESSIONS = s.get("data", {}) if s else {}
-            except Exception as e:
-                print(f"⚠️ Could not load sessions: {e}")
+            except Exception as e: print(f"⚠️ Could not load sessions: {e}")
             try:
                 a = await _sync_to_async(auth_col.find_one, {"_id": "auth"})
                 AUTHORIZED_USERS = a.get("data", {}) if a else {}
-            except Exception as e:
-                print(f"⚠️ Could not load authorized users: {e}")
+            except Exception as e: print(f"⚠️ Could not load authorized users: {e}")
             try:
                 st = await _sync_to_async(settings_col.find_one, {"_id": "settings"})
                 USER_SETTINGS = st.get("data", {}) if st else {}
-            except Exception as e:
-                print(f"⚠️ Could not load settings: {e}")
+            except Exception as e: print(f"⚠️ Could not load settings: {e}")
             try:
                 h = await _sync_to_async(history_col.find_one, {"_id": "history"})
                 PROCESSED_HISTORY = h.get("data", {}) if h else {}
-            except Exception as e:
-                print(f"⚠️ Could not load history: {e}")
+            except Exception as e: print(f"⚠️ Could not load history: {e}")
             try:
                 d = await _sync_to_async(daily_usage_col.find_one, {"_id": "daily_usage"})
                 DAILY_PUBLIC_USAGE = d.get("data", {}) if d else {}
-            except Exception as e:
-                print(f"⚠️ Could not load daily usage: {e}")
+            except Exception as e: print(f"⚠️ Could not load daily usage: {e}")
         else:
-            # JSON loading
             files = {
                 SESSION_FILE: "USER_SESSIONS",
                 AUTH_FILE: "AUTHORIZED_USERS",
@@ -158,51 +148,46 @@ async def load_all_data():
                 if os.path.exists(path):
                     try:
                         globals()[name] = await _read_json(path)
-                    except Exception as e:
-                        print(f"⚠️ Could not load {path}: {e}")
+                    except Exception as e: print(f"⚠️ Could not load {path}: {e}")
 
+# Save functions: NO lock inside — caller holds data_lock if needed
 async def save_sessions():
-    async with data_lock:
-        if USE_MONGO:
-            await _sync_to_async(sessions_col.update_one,
-                {"_id": "sessions"}, {"$set": {"data": USER_SESSIONS}}, upsert=True)
-        else:
-            await _write_json(SESSION_FILE, USER_SESSIONS)
+    if USE_MONGO:
+        await _sync_to_async(sessions_col.update_one,
+            {"_id": "sessions"}, {"$set": {"data": USER_SESSIONS}}, upsert=True)
+    else:
+        await _write_json(SESSION_FILE, USER_SESSIONS)
 
 async def save_authorized_users():
-    async with data_lock:
-        if USE_MONGO:
-            await _sync_to_async(auth_col.update_one,
-                {"_id": "auth"}, {"$set": {"data": AUTHORIZED_USERS}}, upsert=True)
-        else:
-            await _write_json(AUTH_FILE, AUTHORIZED_USERS)
+    if USE_MONGO:
+        await _sync_to_async(auth_col.update_one,
+            {"_id": "auth"}, {"$set": {"data": AUTHORIZED_USERS}}, upsert=True)
+    else:
+        await _write_json(AUTH_FILE, AUTHORIZED_USERS)
 
 async def save_user_settings():
-    async with data_lock:
-        if USE_MONGO:
-            await _sync_to_async(settings_col.update_one,
-                {"_id": "settings"}, {"$set": {"data": USER_SETTINGS}}, upsert=True)
-        else:
-            await _write_json(SETTINGS_FILE, USER_SETTINGS)
+    if USE_MONGO:
+        await _sync_to_async(settings_col.update_one,
+            {"_id": "settings"}, {"$set": {"data": USER_SETTINGS}}, upsert=True)
+    else:
+        await _write_json(SETTINGS_FILE, USER_SETTINGS)
 
 async def save_history():
-    async with data_lock:
-        if USE_MONGO:
-            await _sync_to_async(history_col.update_one,
-                {"_id": "history"}, {"$set": {"data": PROCESSED_HISTORY}}, upsert=True)
-        else:
-            await _write_json(HISTORY_FILE, PROCESSED_HISTORY)
+    if USE_MONGO:
+        await _sync_to_async(history_col.update_one,
+            {"_id": "history"}, {"$set": {"data": PROCESSED_HISTORY}}, upsert=True)
+    else:
+        await _write_json(HISTORY_FILE, PROCESSED_HISTORY)
 
 async def save_daily_usage():
-    async with data_lock:
-        if USE_MONGO:
-            await _sync_to_async(daily_usage_col.update_one,
-                {"_id": "daily_usage"}, {"$set": {"data": DAILY_PUBLIC_USAGE}}, upsert=True)
-        else:
-            await _write_json(DAILY_USAGE_FILE, DAILY_PUBLIC_USAGE)
+    if USE_MONGO:
+        await _sync_to_async(daily_usage_col.update_one,
+            {"_id": "daily_usage"}, {"$set": {"data": DAILY_PUBLIC_USAGE}}, upsert=True)
+    else:
+        await _write_json(DAILY_USAGE_FILE, DAILY_PUBLIC_USAGE)
 
 # ─────────────────────────────────────────────
-# Daily limit check (public links)
+# Daily limit check
 # ─────────────────────────────────────────────
 def check_and_update_daily_limit(user_id: int) -> bool:
     uid_str = str(user_id)
@@ -211,7 +196,6 @@ def check_and_update_daily_limit(user_id: int) -> bool:
     if uid_str not in DAILY_PUBLIC_USAGE:
         DAILY_PUBLIC_USAGE[uid_str] = {"date": today_str, "count": 1}
         return True
-
     entry = DAILY_PUBLIC_USAGE[uid_str]
     if entry["date"] != today_str:
         entry["date"] = today_str
@@ -328,9 +312,9 @@ async def add_subscriber(_bot: Client, m: Message) -> None:
         return
     value, unit  = int(match.group(1)), match.group(2)
     delta        = value * 60 if unit == "m" else (value * 3600 if unit == "h" else value * 86400)
-    async with data_lock:
+    async with data_lock:                          # lock protects the dict mutation + save
         AUTHORIZED_USERS[str(target_id)] = time.time() + delta
-        await save_authorized_users()
+        await save_authorized_users()              # no inner lock → no deadlock
     await m.reply_text(f"✅ Subscriber added: `{target_id}` for `{m.command[2]}`")
 
 @bot.on_message(filters.command(["remuser"]) & filters.user(ADMIN_ID))
@@ -1039,9 +1023,15 @@ async def main():
     try:
         await load_all_data()
     except Exception as e:
-        print(f"❌ Could not load data: {e} – starting with empty caches.")
-    await bot.start()
-    print("✅ Bot is running…")
+        print(f"❌ Data load error: {e}")
+
+    try:
+        await bot.start()
+        print("✅ Bot is running…")
+    except Exception as e:
+        print(f"❌ FATAL — Bot failed to start: {e}")
+        return
+
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
