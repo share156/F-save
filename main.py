@@ -37,10 +37,16 @@ USE_MONGO = bool(MONGO_URI)
 print(f"✅ Using {'MongoDB' if USE_MONGO else 'JSON files'} for persistence.")
 
 # ─────────────────────────────────────────────
-# Database setup
+# Database setup (short timeouts so the bot never hangs)
 # ─────────────────────────────────────────────
 if USE_MONGO:
-    mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    mongo_client = MongoClient(
+        MONGO_URI,
+        serverSelectionTimeoutMS=5000,
+        connectTimeoutMS=5000,
+        socketTimeoutMS=5000,
+        waitQueueTimeoutMS=5000,
+    )
     db = mongo_client["telegram_bot_db"]
     sessions_col = db["sessions"]
     auth_col     = db["authorized_users"]
@@ -150,7 +156,7 @@ async def load_all_data():
                         globals()[name] = await _read_json(path)
                     except Exception as e: print(f"⚠️ Could not load {path}: {e}")
 
-# Save functions: NO lock inside — caller holds data_lock if needed
+# Save functions — no lock inside (caller holds data_lock)
 async def save_sessions():
     if USE_MONGO:
         await _sync_to_async(sessions_col.update_one,
@@ -312,9 +318,9 @@ async def add_subscriber(_bot: Client, m: Message) -> None:
         return
     value, unit  = int(match.group(1)), match.group(2)
     delta        = value * 60 if unit == "m" else (value * 3600 if unit == "h" else value * 86400)
-    async with data_lock:                          # lock protects the dict mutation + save
+    async with data_lock:
         AUTHORIZED_USERS[str(target_id)] = time.time() + delta
-        await save_authorized_users()              # no inner lock → no deadlock
+        await save_authorized_users()
     await m.reply_text(f"✅ Subscriber added: `{target_id}` for `{m.command[2]}`")
 
 @bot.on_message(filters.command(["remuser"]) & filters.user(ADMIN_ID))
@@ -1017,11 +1023,13 @@ async def process_single_link(link: str, original_msg: Message, uid: int = 0) ->
                 except: pass
 
 # ─────────────────────────────────────────────
-# Entry point
+# Entry point (hard timeout on data loading)
 # ─────────────────────────────────────────────
 async def main():
     try:
-        await load_all_data()
+        await asyncio.wait_for(load_all_data(), timeout=10)
+    except asyncio.TimeoutError:
+        print("⚠️ MongoDB loading timed out – starting with empty caches.")
     except Exception as e:
         print(f"❌ Data load error: {e}")
 
