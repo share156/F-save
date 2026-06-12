@@ -20,8 +20,9 @@ bot_token = os.environ.get("TOKEN", "")
 api_hash = os.environ.get("HASH", "")  
 api_id = os.environ.get("ID", "")      
 
-# ⚠️ REPLACE WITH YOUR ACTUAL NUMERIC TELEGRAM USER ID
-ADMIN_ID = 123456789  
+# Now pulls securely from Render, defaults to 0 if missing
+ADMIN_ID = int(os.environ.get("ADMIN_ID", 0)) 
+
 
 bot = Client("mybot", api_id=api_id, api_hash=api_hash, bot_token=bot_token)
 
