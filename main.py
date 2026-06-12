@@ -1,5 +1,5 @@
 import pyrogram
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.errors import (
     UserAlreadyParticipant, InviteHashExpired, FloodWait,
     PeerIdInvalid, SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired,
@@ -337,6 +337,12 @@ async def remove_subscriber(_bot: Client, m: Message) -> None:
 # ─────────────────────────────────────────────
 @bot.on_callback_query()
 async def handle_settings_callbacks(client: Client, cb: CallbackQuery) -> None:
+    # BUG FIX: Answer immediately to stop UI button spinning before processing DB tasks
+    try:
+        await cb.answer()
+    except:
+        pass
+
     uid_str = str(cb.from_user.id)
     data    = cb.data
     config  = init_user_config(uid_str)
@@ -403,10 +409,6 @@ async def handle_settings_callbacks(client: Client, cb: CallbackQuery) -> None:
             }
             await save_user_settings()
         await cb.message.edit_text("⚙️ Configurations cleared.", reply_markup=get_main_settings_keyboard())
-    try:
-        await cb.answer()
-    except:
-        pass
 
 # ─────────────────────────────────────────────
 # Content filter
@@ -419,6 +421,7 @@ def passed_content_filters(uid_str: str, msg: Message, context: str) -> bool:
     keywords = cfg.get("keywords", [])
     if keywords and not any(kw.strip().lower() in msg_text for kw in keywords if kw.strip()):
         return False
+    
     is_text_only = not any([msg.document, msg.video, msg.photo, msg.audio,
                             msg.voice, msg.animation, msg.sticker, msg.poll])
     if is_text_only and not cfg.get("text", True):       return False
@@ -430,12 +433,14 @@ def passed_content_filters(uid_str: str, msg: Message, context: str) -> bool:
     if msg.animation and not cfg.get("animation", True): return False
     if msg.sticker   and not cfg.get("sticker", True):   return False
     if msg.poll      and not cfg.get("poll", True):      return False
-    media = msg.document or msg.video or msg.audio or msg.voice or msg.animation
+    
+    # BUG FIX: Ensure photo logic doesn't crash extension/size limit filters
+    media = msg.document or msg.video or msg.audio or msg.voice or msg.animation or msg.photo
     if media:
         if cfg.get("size_limit", 0) > 0 and (getattr(media, "file_size", 0) / 1_048_576) > cfg["size_limit"]:
             return False
         exts = cfg.get("extensions", [])
-        if exts:
+        if exts and not msg.photo: # Photos don't have distinct extensions like docs do
             fname = getattr(media, "file_name", "").lower()
             if not any(fname.endswith(f".{e.lower()}") for e in exts):
                 return False
@@ -1040,7 +1045,9 @@ async def main():
         print(f"❌ FATAL — Bot failed to start: {e}")
         return
 
-    await asyncio.Event().wait()
+    # BUG FIX: Use idle() instead of Event().wait() for graceful shutdown
+    await idle()
+    await bot.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())
