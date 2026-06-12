@@ -1,29 +1,64 @@
+"""
+Pyrogram Telegram Bot — Final Merged & Fully Fixed Version
+===========================================================
+Takes the best from both previous versions:
+
+  FROM version 2 (new code):
+    ✔ Async JSON file I/O with asyncio.to_thread()
+    ✔ Full filter UI — all 10 media types shown on page 1
+    ✔ Smart thumbnail fallback (uses message's own thumb if no custom one set)
+    ✔ Public-channel custom-thumbnail support (download + re-upload)
+    ✔ filters.user(ADMIN_ID) for cleaner admin-only routing
+    ✔ asyncio.run(main()) proper startup
+
+  FROM version 1 (my fixes):
+    ✔ api_id must be int — string causes crash on startup
+    ✔ ADMIN_ID read from env var, not hardcoded
+    ✔ CallbackQuery cannot be instantiated manually — replaced with helper builders
+    ✔ StopIteration in async → DownloadCancelled custom exception (PEP 479)
+    ✔ elapsed_time uses max() not "or 0.01"
+    ✔ CANCEL_BATCH reset before the loop, NOT inside process_single_link
+    ✔ temp_client disconnected on phone-send error (resource leak)
+    ✔ ACTIVE_LOGINS cleaned up after successful login
+    ✔ Guards for expired ACTIVE_LOGINS after bot restart mid-login
+    ✔ /login checks for existing session first
+    ✔ /status shows admin as unlimited
+    ✔ PhoneCodeInvalid / PhoneCodeExpired handled explicitly
+
+  EXTRA FIX (bug in version 2's locking design):
+    ✔ Removed deadlock: save functions now own the single _file_lock.
+      Callers never hold it themselves, so no double-acquire is possible.
+"""
+
 import pyrogram
 from pyrogram import Client, filters
 from pyrogram.errors import (
     UserAlreadyParticipant, InviteHashExpired, FloodWait,
     PeerIdInvalid, SessionPasswordNeeded, PhoneCodeInvalid, PhoneCodeExpired,
     ChannelPrivate, UserNotParticipant, ChatForbidden,
-    RPCError
+    RPCError,
 )
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 import asyncio
-import time
+import json
 import os
 import re
-from datetime import datetime
-from pymongo import MongoClient
+import time
 
-# --------------- Configuration ---------------
+# ─────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────
 bot_token = os.environ.get("TOKEN", "")
-api_hash  = os.environ.get("HASH", "")
+api_hash  = os.environ.get("HASH",  "")
 
+# FIX: api_id MUST be int — Pyrogram rejects a string and crashes immediately.
 try:
     api_id = int(os.environ.get("ID", 0))
 except ValueError:
     api_id = 0
 
+# FIX: ADMIN_ID from environment, never hardcoded in source.
 try:
     ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
 except ValueError:
@@ -31,33 +66,18 @@ except ValueError:
 
 bot = Client("mybot", api_id=api_id, api_hash=api_hash, bot_token=bot_token)
 
-# --------------- Data Persistence Layers (MongoDB) ---------------
-MONGO_URI = os.environ.get("MONGO_URI", "")
+# ─────────────────────────────────────────────
+# In-memory state
+# ─────────────────────────────────────────────
+USER_SESSIONS     : dict = {}
+AUTHORIZED_USERS  : dict = {}
+USER_SETTINGS     : dict = {}
+PROCESSED_HISTORY : dict = {}
 
-if MONGO_URI:
-    mongo_client = MongoClient(MONGO_URI)
-    db           = mongo_client["telegram_bot_db"]
-    sessions_col = db["sessions"]
-    auth_col     = db["authorized_users"]
-    settings_col = db["settings"]
-    history_col  = db["history"]
-else:
-    print("⚠️ WARNING: MONGO_URI is missing. Database will not work properly.")
-    mongo_client = None
-    sessions_col = auth_col = settings_col = history_col = None
-
-USER_SESSIONS    = {}
-AUTHORIZED_USERS = {}
-USER_SETTINGS    = {}
-PROCESSED_HISTORY = {}
-
-USER_STATES    = {}
-ACTIVE_LOGINS  = {}
-CANCEL_BATCH   = {}
-RUNNING_CLIENTS = {}
-
-# Async lock for shared data + MongoDB writes
-data_lock = asyncio.Lock()
+USER_STATES     : dict = {}   # conversation FSM
+ACTIVE_LOGINS   : dict = {}   # temp login data
+CANCEL_BATCH    : dict = {}   # per-user cancellation flag
+RUNNING_CLIENTS : dict = {}   # live user client pool
 
 DEFAULT_FILTERS = {
     "forward_tag":    False,
@@ -72,142 +92,144 @@ DEFAULT_FILTERS = {
     "poll":           True,
     "skip_duplicate": True,
     "secure_message": False,
-    "size_limit":     0,
+    "size_limit":     0,     # MB; 0 = unlimited
     "extensions":     [],
-    "keywords":       []
+    "keywords":       [],
 }
 
+# ─────────────────────────────────────────────
+# Async JSON persistence
+# ─────────────────────────────────────────────
+SESSION_FILE  = "sessions.json"
+AUTH_FILE     = "authorized_users.json"
+SETTINGS_FILE = "user_settings.json"
+HISTORY_FILE  = "processed_history.json"
+
+# FIX (deadlock): A single lock that only the _write_json helper acquires.
+# Save functions call _write_json — callers never hold this lock themselves,
+# so there is ZERO risk of double-acquisition / deadlock.
+_file_lock = asyncio.Lock()
+
+
+async def _write_json(path: str, data: dict) -> None:
+    """Write data to a JSON file, serialised through _file_lock."""
+    async with _file_lock:
+        def _inner():
+            with open(path, "w") as fh:
+                json.dump(data, fh, indent=4)
+        await asyncio.to_thread(_inner)
+
+
+async def _read_json(path: str) -> dict:
+    """Read a JSON file off the event-loop thread."""
+    def _inner():
+        with open(path, "r") as fh:
+            return json.load(fh)
+    return await asyncio.to_thread(_inner)
+
+
+async def load_data() -> None:
+    global USER_SESSIONS, AUTHORIZED_USERS, USER_SETTINGS, PROCESSED_HISTORY
+    pairs = [
+        (SESSION_FILE,  "USER_SESSIONS"),
+        (AUTH_FILE,     "AUTHORIZED_USERS"),
+        (SETTINGS_FILE, "USER_SETTINGS"),
+        (HISTORY_FILE,  "PROCESSED_HISTORY"),
+    ]
+    for path, name in pairs:
+        if os.path.exists(path):
+            try:
+                globals()[name] = await _read_json(path)
+            except Exception as exc:
+                print(f"⚠️  Could not load {path}: {exc}")
+
+
+async def save_sessions()         -> None: await _write_json(SESSION_FILE,  USER_SESSIONS)
+async def save_authorized_users() -> None: await _write_json(AUTH_FILE,     AUTHORIZED_USERS)
+async def save_user_settings()    -> None: await _write_json(SETTINGS_FILE, USER_SETTINGS)
+async def save_history()          -> None: await _write_json(HISTORY_FILE,  PROCESSED_HISTORY)
+
+# ─────────────────────────────────────────────
+# FIX: custom exception for download cancellation
+# StopIteration inside a coroutine body is converted to RuntimeError
+# by Python 3.7+ (PEP 479), causing an unhandled crash.
+# ─────────────────────────────────────────────
 class DownloadCancelled(Exception):
-    """Raised when user cancels a download/upload via progress callback."""
     pass
 
-# --------------- Async-safe MongoDB helpers ---------------
-async def _sync_to_async(func, *args, **kwargs):
-    """Run a synchronous pymongo call in a thread to avoid blocking the event loop."""
-    return await asyncio.to_thread(func, *args, **kwargs)
-
-async def load_data():
-    global USER_SESSIONS, AUTHORIZED_USERS, USER_SETTINGS, PROCESSED_HISTORY
-    if not MONGO_URI:
-        return
-    async with data_lock:
-        try:
-            s_doc = await _sync_to_async(sessions_col.find_one, {"_id": "sessions"})
-            USER_SESSIONS = s_doc.get("data", {}) if s_doc else {}
-        except Exception as e:
-            print(f"Error loading sessions: {e}")
-        try:
-            a_doc = await _sync_to_async(auth_col.find_one, {"_id": "auth"})
-            AUTHORIZED_USERS = a_doc.get("data", {}) if a_doc else {}
-        except Exception as e:
-            print(f"Error loading authorized users: {e}")
-        try:
-            set_doc = await _sync_to_async(settings_col.find_one, {"_id": "settings"})
-            USER_SETTINGS = set_doc.get("data", {}) if set_doc else {}
-        except Exception as e:
-            print(f"Error loading settings: {e}")
-        try:
-            h_doc = await _sync_to_async(history_col.find_one, {"_id": "history"})
-            PROCESSED_HISTORY = h_doc.get("data", {}) if h_doc else {}
-        except Exception as e:
-            print(f"Error loading history: {e}")
-
-async def save_sessions():
-    if MONGO_URI:
-        async with data_lock:
-            await _sync_to_async(
-                sessions_col.update_one,
-                {"_id": "sessions"},
-                {"$set": {"data": USER_SESSIONS}},
-                upsert=True
-            )
-
-async def save_authorized_users():
-    if MONGO_URI:
-        async with data_lock:
-            await _sync_to_async(
-                auth_col.update_one,
-                {"_id": "auth"},
-                {"$set": {"data": AUTHORIZED_USERS}},
-                upsert=True
-            )
-
-async def save_user_settings():
-    if MONGO_URI:
-        async with data_lock:
-            await _sync_to_async(
-                settings_col.update_one,
-                {"_id": "settings"},
-                {"$set": {"data": USER_SETTINGS}},
-                upsert=True
-            )
-
-async def save_history():
-    if MONGO_URI:
-        async with data_lock:
-            await _sync_to_async(
-                history_col.update_one,
-                {"_id": "history"},
-                {"$set": {"data": PROCESSED_HISTORY}},
-                upsert=True
-            )
-
-# --------------- Subscription Protection Filter ---------------
-async def is_subscribed(_, __, message: Message):
+# ─────────────────────────────────────────────
+# Subscription guard filter
+# ─────────────────────────────────────────────
+async def is_subscribed(_, __, message: Message) -> bool:
     if message.from_user and message.from_user.id == ADMIN_ID:
         return True
 
-    user_id   = message.from_user.id if message.from_user else message.chat.id
-    str_uid   = str(user_id)
-    current_time = time.time()
+    uid     = message.from_user.id if message.from_user else message.chat.id
+    str_uid = str(uid)
 
-    async with data_lock:
-        if str_uid in AUTHORIZED_USERS:
-            expiry_time = AUTHORIZED_USERS[str_uid]
-            if current_time < expiry_time:
-                return True
-            else:
-                AUTHORIZED_USERS.pop(str_uid, None)
-                await save_authorized_users()
-                if user_id in RUNNING_CLIENTS:
-                    try: await RUNNING_CLIENTS[user_id].stop()
-                    except: pass
-                    RUNNING_CLIENTS.pop(user_id, None)
+    if str_uid in AUTHORIZED_USERS:
+        if time.time() < AUTHORIZED_USERS[str_uid]:
+            return True
+        # Expired — revoke and stop their client
+        AUTHORIZED_USERS.pop(str_uid, None)
+        await save_authorized_users()
+        if uid in RUNNING_CLIENTS:
+            try: await RUNNING_CLIENTS[uid].stop()
+            except: pass
+            RUNNING_CLIENTS.pop(uid, None)
 
-    try: await message.reply_text("⚠️ **Access Denied / Expired**\nPlease contact the Administrator.")
-    except: pass
+    try:
+        await message.reply_text(
+            "⚠️ **Access Denied / Expired**\nPlease contact the Administrator."
+        )
+    except:
+        pass
     return False
+
 
 subscribed_only = filters.create(is_subscribed)
 
-# --------------- Menu/Keyboard Helpers ---------------
-def init_user_config(uid_str):
+# ─────────────────────────────────────────────
+# User config helpers
+# ─────────────────────────────────────────────
+def init_user_config(uid_str: str) -> dict:
+    """
+    Ensure an in-memory config entry exists for the user.
+    Does NOT save to disk — callers save explicitly when they mutate.
+    """
     if uid_str not in USER_SETTINGS:
         USER_SETTINGS[uid_str] = {
-            "caption": "", "use_caption": False,
-            "thumb": "",   "use_thumb": False,
-            "filters": DEFAULT_FILTERS.copy()
+            "caption":     "",
+            "use_caption": False,
+            "thumb":       "",
+            "use_thumb":   False,
+            "filters":     DEFAULT_FILTERS.copy(),
         }
     else:
         if "filters" not in USER_SETTINGS[uid_str]:
             USER_SETTINGS[uid_str]["filters"] = DEFAULT_FILTERS.copy()
         else:
-            for key, val in DEFAULT_FILTERS.items():
-                if key not in USER_SETTINGS[uid_str]["filters"]:
-                    USER_SETTINGS[uid_str]["filters"][key] = val
+            for k, v in DEFAULT_FILTERS.items():
+                USER_SETTINGS[uid_str]["filters"].setdefault(k, v)
     return USER_SETTINGS[uid_str]
 
-def get_main_settings_keyboard():
+# ─────────────────────────────────────────────
+# Keyboard builders
+# ─────────────────────────────────────────────
+def get_main_settings_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🖊️ CAPTION",  callback_data="menu_caption"),
-         InlineKeyboardButton("🖼️ THUMBNAIL", callback_data="menu_thumb")],
-        [InlineKeyboardButton("🧹 FILTERS",   callback_data="menu_filters_page1")],
-        [InlineKeyboardButton("🗑️ Reset All Profiles", callback_data="clear_all")]
+        [
+            InlineKeyboardButton("🖊️ CAPTION",   callback_data="menu_caption"),
+            InlineKeyboardButton("🖼️ THUMBNAIL",  callback_data="menu_thumb"),
+        ],
+        [InlineKeyboardButton("🧹 FILTERS",        callback_data="menu_filters_page1")],
+        [InlineKeyboardButton("🗑️ Reset All Configuration Profiles", callback_data="clear_all")],
     ])
 
-def get_filters_page1_keyboard(uid_str):
-    config = init_user_config(uid_str)["filters"]
-    def si(key): return "✅" if config.get(key, False) else "❌"
+
+def get_filters_page1_keyboard(uid_str: str) -> InlineKeyboardMarkup:
+    cfg = init_user_config(uid_str)["filters"]
+    def si(k): return "✅" if cfg.get(k, False) else "❌"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🏷️ Forward tag", callback_data="f1_toggle:forward_tag"), InlineKeyboardButton(si("forward_tag"), callback_data="f1_toggle:forward_tag")],
         [InlineKeyboardButton("🖊️ Text",        callback_data="f1_toggle:text"),        InlineKeyboardButton(si("text"),        callback_data="f1_toggle:text")],
@@ -219,349 +241,445 @@ def get_filters_page1_keyboard(uid_str):
         [InlineKeyboardButton("🎭 Animation",   callback_data="f1_toggle:animation"),   InlineKeyboardButton(si("animation"),   callback_data="f1_toggle:animation")],
         [InlineKeyboardButton("🃏 Sticker",     callback_data="f1_toggle:sticker"),     InlineKeyboardButton(si("sticker"),     callback_data="f1_toggle:sticker")],
         [InlineKeyboardButton("📊 Poll",        callback_data="f1_toggle:poll"),        InlineKeyboardButton(si("poll"),        callback_data="f1_toggle:poll")],
-        [InlineKeyboardButton("◀️ back", callback_data="menu_main"), InlineKeyboardButton("next ▶️", callback_data="menu_filters_page2")]
+        [
+            InlineKeyboardButton("◀️ back",   callback_data="menu_main"),
+            InlineKeyboardButton("next ▶️",   callback_data="menu_filters_page2"),
+        ],
     ])
 
-def get_filters_page2_keyboard(uid_str):
-    config    = init_user_config(uid_str)["filters"]
-    dup_st    = "✅" if config.get("skip_duplicate", True)  else "❌"
-    sec_st    = "✅" if config.get("secure_message", False) else "❌"
-    size_lbl  = f"🔩 size limit ({config.get('size_limit', 0)}MB)"
-    ext_lbl   = f"💾 Extension ({len(config.get('extensions', []))} active)"
-    kw_lbl    = f"🕵️ keywords ({len(config.get('keywords', []))} saved)"
+
+def get_filters_page2_keyboard(uid_str: str) -> InlineKeyboardMarkup:
+    cfg      = init_user_config(uid_str)["filters"]
+    dup_st   = "✅" if cfg.get("skip_duplicate", True)  else "❌"
+    sec_st   = "✅" if cfg.get("secure_message", False) else "❌"
+    size_lbl = f"🔩 Size limit ({cfg.get('size_limit', 0)} MB)"
+    ext_lbl  = f"💾 Extensions ({len(cfg.get('extensions', []))} active)"
+    kw_lbl   = f"🕵️ Keywords ({len(cfg.get('keywords', []))} saved)"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("▶️ Skip duplicate",  callback_data="f2_toggle:skip_duplicate"), InlineKeyboardButton(dup_st, callback_data="f2_toggle:skip_duplicate")],
         [InlineKeyboardButton("🔒 Secure message", callback_data="f2_toggle:secure_message"), InlineKeyboardButton(sec_st, callback_data="f2_toggle:secure_message")],
         [InlineKeyboardButton(size_lbl, callback_data="f2_set:size_limit"), InlineKeyboardButton(ext_lbl, callback_data="f2_set:extensions")],
         [InlineKeyboardButton(kw_lbl,   callback_data="f2_set:keywords")],
-        [InlineKeyboardButton("◀️ back", callback_data="menu_filters_page1")]
+        [InlineKeyboardButton("◀️ back", callback_data="menu_filters_page1")],
     ])
 
-def _build_caption_menu(config):
-    cap_status = "🟢 ON" if config["use_caption"] else "🔴 OFF"
-    text = f"📝 **Caption Configuration**\nCurrent: `{config['caption'] or 'None'}`"
-    kb   = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"Toggle Caption Mode: {cap_status}", callback_data="toggle_cap_mode")],
-        [InlineKeyboardButton("📝 Provide New Caption Text String",  callback_data="prompt_set_cap")],
-        [InlineKeyboardButton("◀️ Return to Settings",               callback_data="menu_main")]
-    ])
-    return text, kb
 
-def _build_thumb_menu(config):
-    thumb_status = "🟢 ON" if config["use_thumb"] else "🔴 OFF"
-    text = "🖼️ **Custom Thumbnail Panels**"
-    kb   = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"Toggle Custom Thumb: {thumb_status}", callback_data="toggle_thumb_mode")],
-        [InlineKeyboardButton("🖼️ Register Custom Image",             callback_data="prompt_set_thumb")],
-        [InlineKeyboardButton("◀️ Return to Settings",                callback_data="menu_main")]
+# FIX: Extract caption/thumb builders so toggle handlers can refresh the menu
+# WITHOUT trying to construct a CallbackQuery object manually.
+# Pyrogram types are server-provided; you CANNOT instantiate them with kwargs —
+# doing so crashes at runtime with a TypeError or missing-field error.
+def _build_caption_menu(config: dict):
+    status = "🟢 ON" if config["use_caption"] else "🔴 OFF"
+    text   = f"📝 **Caption Configuration**\nCurrent: `{config['caption'] or 'None'}`"
+    kb     = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Toggle Caption Mode: {status}", callback_data="toggle_cap_mode")],
+        [InlineKeyboardButton("📝 Set New Caption Text",        callback_data="prompt_set_cap")],
+        [InlineKeyboardButton("◀️ Return to Settings",          callback_data="menu_main")],
     ])
     return text, kb
 
-# --------------- Admin Commands ---------------
-@bot.on_message(filters.command(["adduser"]))
-async def add_subscriber(bot: Client, m: Message):
-    if m.from_user.id != ADMIN_ID: return
-    if len(m.command) < 3: return
-    target_id, duration_str = m.command[1], m.command[2].lower()
-    if not target_id.isdigit(): return
-    match = re.match(r"^(\d+)([mhd])$", duration_str)
-    if not match: return
-    value, unit    = int(match.group(1)), match.group(2)
-    seconds_delta  = value * 60 if unit == 'm' else (value * 3600 if unit == 'h' else value * 86400)
-    async with data_lock:
-        AUTHORIZED_USERS[str(target_id)] = time.time() + seconds_delta
-        await save_authorized_users()
-    await m.reply_text(f"✅ Subscriber Account Added: `{target_id}`")
 
-@bot.on_message(filters.command(["remuser"]))
-async def remove_subscriber(bot: Client, m: Message):
-    if m.from_user.id != ADMIN_ID: return
-    if len(m.command) < 2: return
-    async with data_lock:
-        AUTHORIZED_USERS.pop(m.command[1], None)
-        await save_authorized_users()
+def _build_thumb_menu(config: dict):
+    status = "🟢 ON" if config["use_thumb"] else "🔴 OFF"
+    text   = "🖼️ **Custom Thumbnail Panel**"
+    kb     = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Toggle Custom Thumb: {status}", callback_data="toggle_thumb_mode")],
+        [InlineKeyboardButton("🖼️ Register New Thumbnail",      callback_data="prompt_set_thumb")],
+        [InlineKeyboardButton("◀️ Return to Settings",           callback_data="menu_main")],
+    ])
+    return text, kb
+
+# ─────────────────────────────────────────────
+# Admin commands
+# ─────────────────────────────────────────────
+@bot.on_message(filters.command(["adduser"]) & filters.user(ADMIN_ID))
+async def add_subscriber(_bot: Client, m: Message) -> None:
+    if len(m.command) < 3:
+        await m.reply_text("Usage: `/adduser <user_id> <duration>` (e.g. `30d`, `12h`, `60m`)")
+        return
+    target_id, dur_str = m.command[1], m.command[2].lower()
+    if not target_id.isdigit():
+        return
+    match = re.match(r"^(\d+)([mhd])$", dur_str)
+    if not match:
+        await m.reply_text("❌ Duration format: `<number><m|h|d>` (e.g. `7d`, `24h`)")
+        return
+    value, unit  = int(match.group(1)), match.group(2)
+    delta        = value * 60 if unit == "m" else (value * 3600 if unit == "h" else value * 86400)
+    AUTHORIZED_USERS[str(target_id)] = time.time() + delta
+    await save_authorized_users()
+    await m.reply_text(f"✅ Subscriber added: `{target_id}` for `{m.command[2]}`")
+
+
+@bot.on_message(filters.command(["remuser"]) & filters.user(ADMIN_ID))
+async def remove_subscriber(_bot: Client, m: Message) -> None:
+    if len(m.command) < 2:
+        return
+    AUTHORIZED_USERS.pop(m.command[1], None)
+    await save_authorized_users()
     await m.reply_text("🗑️ Target privileges revoked.")
 
-# --------------- Interactive Callback Queries Engine ---------------
+# ─────────────────────────────────────────────
+# Callback query handler
+# ─────────────────────────────────────────────
 @bot.on_callback_query()
-async def handle_settings_callbacks(client: Client, cb: CallbackQuery):
+async def handle_settings_callbacks(client: Client, cb: CallbackQuery) -> None:
     uid_str = str(cb.from_user.id)
     data    = cb.data
     config  = init_user_config(uid_str)
 
     if data == "menu_main":
-        await cb.message.edit_text("⚙️ **Main Custom Output Settings Panel**",
-                                   reply_markup=get_main_settings_keyboard())
+        await cb.message.edit_text(
+            "⚙️ **Main Custom Output Settings Panel**",
+            reply_markup=get_main_settings_keyboard()
+        )
+
     elif data == "menu_caption":
-        text, kb = _build_caption_menu(config)
-        await cb.message.edit_text(text, reply_markup=kb)
+        txt, kb = _build_caption_menu(config)
+        await cb.message.edit_text(txt, reply_markup=kb)
+
     elif data == "toggle_cap_mode":
+        # FIX: toggle inline using the builder — no CallbackQuery instantiation
         config["use_caption"] = not config["use_caption"]
         await save_user_settings()
-        text, kb = _build_caption_menu(config)
-        await cb.message.edit_text(text, reply_markup=kb)
+        txt, kb = _build_caption_menu(config)
+        await cb.message.edit_text(txt, reply_markup=kb)
+
     elif data == "prompt_set_cap":
         USER_STATES[uid_str] = "SETTING_CAPTION"
-        await cb.message.reply_text("📝 Send your custom caption string below:")
+        await cb.message.reply_text("📝 Send your custom caption string:")
+
     elif data == "menu_thumb":
-        text, kb = _build_thumb_menu(config)
-        await cb.message.edit_text(text, reply_markup=kb)
+        txt, kb = _build_thumb_menu(config)
+        await cb.message.edit_text(txt, reply_markup=kb)
+
     elif data == "toggle_thumb_mode":
+        # FIX: same pattern — inline builder, no bogus CallbackQuery object
         config["use_thumb"] = not config["use_thumb"]
         await save_user_settings()
-        text, kb = _build_thumb_menu(config)
-        await cb.message.edit_text(text, reply_markup=kb)
+        txt, kb = _build_thumb_menu(config)
+        await cb.message.edit_text(txt, reply_markup=kb)
+
     elif data == "prompt_set_thumb":
         USER_STATES[uid_str] = "SETTING_THUMBNAIL"
-        await cb.message.reply_text("🖼️ Send a photo file to use as the thumbnail:")
+        await cb.message.reply_text("🖼️ Send a photo to use as the thumbnail:")
+
     elif data == "menu_filters_page1":
-        await cb.message.edit_text("⭐ **Content Filtering (Page 1)**",
-                                   reply_markup=get_filters_page1_keyboard(uid_str))
+        await cb.message.edit_text(
+            "⭐ **Content Filtering — Page 1**",
+            reply_markup=get_filters_page1_keyboard(uid_str)
+        )
+
     elif data == "menu_filters_page2":
-        await cb.message.edit_text("⚙️ **Advanced Filtering (Page 2)**",
-                                   reply_markup=get_filters_page2_keyboard(uid_str))
-    elif data.startswith("f1_toggle:") or data.startswith("f2_toggle:"):
+        await cb.message.edit_text(
+            "⚙️ **Advanced Filtering — Page 2**",
+            reply_markup=get_filters_page2_keyboard(uid_str)
+        )
+
+    elif data.startswith("f1_toggle:"):
         key = data.split(":")[1]
         config["filters"][key] = not config["filters"].get(key, False)
         await save_user_settings()
-        kb = get_filters_page1_keyboard(uid_str) if "f1_" in data else get_filters_page2_keyboard(uid_str)
-        await cb.message.edit_reply_markup(reply_markup=kb)
+        await cb.message.edit_reply_markup(
+            reply_markup=get_filters_page1_keyboard(uid_str)
+        )
+
+    elif data.startswith("f2_toggle:"):
+        key = data.split(":")[1]
+        config["filters"][key] = not config["filters"].get(key, False)
+        await save_user_settings()
+        await cb.message.edit_reply_markup(
+            reply_markup=get_filters_page2_keyboard(uid_str)
+        )
+
     elif data.startswith("f2_set:"):
         target = data.split(":")[1]
         if target == "size_limit":
             USER_STATES[uid_str] = "SETTING_SIZE_LIMIT"
-            await cb.message.reply_text("🔩 Enter max allowed file size in MB (Send `0` for unlimited):")
+            await cb.message.reply_text(
+                "🔩 Enter the max file size in MB (send `0` for unlimited):"
+            )
         elif target == "extensions":
             USER_STATES[uid_str] = "SETTING_EXTENSIONS"
-            await cb.message.reply_text("💾 Send allowed extensions separated by spaces (e.g. `mp4 pdf`). Send `clear` to reset:")
+            await cb.message.reply_text(
+                "💾 Send allowed extensions separated by spaces (e.g. `mp4 pdf`).\n"
+                "Send `clear` to reset."
+            )
         elif target == "keywords":
             USER_STATES[uid_str] = "SETTING_KEYWORDS"
-            await cb.message.reply_text("🕵️ Send keywords separated by commas. Send `clear` to remove all:")
+            await cb.message.reply_text(
+                "🕵️ Send keywords separated by commas.\nSend `clear` to remove all."
+            )
+
     elif data == "clear_all":
-        async with data_lock:
-            USER_SETTINGS[uid_str] = {
-                "caption": "", "use_caption": False,
-                "thumb": "",   "use_thumb": False,
-                "filters": DEFAULT_FILTERS.copy()
-            }
-            await save_user_settings()
-        await cb.message.edit_text("⚙️ Configurations cleared.", reply_markup=get_main_settings_keyboard())
+        USER_SETTINGS[uid_str] = {
+            "caption":     "",
+            "use_caption": False,
+            "thumb":       "",
+            "use_thumb":   False,
+            "filters":     DEFAULT_FILTERS.copy(),
+        }
+        await save_user_settings()
+        await cb.message.edit_text(
+            "⚙️ All configurations reset to defaults.",
+            reply_markup=get_main_settings_keyboard()
+        )
 
-    try: await cb.answer()
-    except: pass
+    try:
+        await cb.answer()
+    except:
+        pass
 
-# --------------- Content Extraction Validation ---------------
-def passed_content_filters(uid_str, msg: Message, chat_link_context: str) -> bool:
-    config = init_user_config(uid_str)["filters"]
+# ─────────────────────────────────────────────
+# Content filter engine
+# ─────────────────────────────────────────────
+def passed_content_filters(uid_str: str, msg: Message, context: str) -> bool:
+    cfg = init_user_config(uid_str)["filters"]
 
-    if config.get("skip_duplicate", True):
-        if chat_link_context in PROCESSED_HISTORY.get(uid_str, []):
+    if cfg.get("skip_duplicate", True):
+        if context in PROCESSED_HISTORY.get(uid_str, []):
             return False
 
     msg_text = (msg.text or msg.caption or "").lower()
-    keywords = config.get("keywords", [])
+    keywords = cfg.get("keywords", [])
     if keywords:
         if not any(kw.strip().lower() in msg_text for kw in keywords if kw.strip()):
             return False
 
-    is_text_only = not any([msg.document, msg.video, msg.photo, msg.audio,
-                            msg.voice, msg.animation, msg.sticker, msg.poll])
-    if is_text_only and not config.get("text", True):       return False
-    if msg.document  and not config.get("document", True):  return False
-    if msg.video     and not config.get("video", True):     return False
-    if msg.photo     and not config.get("photo", True):     return False
-    if msg.audio     and not config.get("audio", True):     return False
-    if msg.voice     and not config.get("voice", True):     return False
-    if msg.animation and not config.get("animation", True): return False
-    if msg.sticker   and not config.get("sticker", True):   return False
-    if msg.poll      and not config.get("poll", True):      return False
+    is_text_only = not any([
+        msg.document, msg.video, msg.photo, msg.audio,
+        msg.voice, msg.animation, msg.sticker, msg.poll,
+    ])
+    if is_text_only and not cfg.get("text",      True): return False
+    if msg.document  and not cfg.get("document",  True): return False
+    if msg.video     and not cfg.get("video",     True): return False
+    if msg.photo     and not cfg.get("photo",     True): return False
+    if msg.audio     and not cfg.get("audio",     True): return False
+    if msg.voice     and not cfg.get("voice",     True): return False
+    if msg.animation and not cfg.get("animation", True): return False
+    if msg.sticker   and not cfg.get("sticker",   True): return False
+    if msg.poll      and not cfg.get("poll",      True): return False
 
-    media_obj = msg.document or msg.video or msg.audio or msg.voice or msg.animation
-    if media_obj:
-        size_limit_mb = config.get("size_limit", 0)
-        if size_limit_mb > 0:
-            if (getattr(media_obj, "file_size", 0) / (1024 * 1024)) > size_limit_mb:
-                return False
-        allowed_exts = config.get("extensions", [])
-        if allowed_exts:
-            file_name = getattr(media_obj, "file_name", "").lower()
-            if not any(file_name.endswith(f".{ext.lower()}") for ext in allowed_exts):
+    media = msg.document or msg.video or msg.audio or msg.voice or msg.animation
+    if media:
+        limit_mb = cfg.get("size_limit", 0)
+        if limit_mb > 0 and (getattr(media, "file_size", 0) / 1_048_576) > limit_mb:
+            return False
+        exts = cfg.get("extensions", [])
+        if exts:
+            fname = getattr(media, "file_name", "").lower()
+            if not any(fname.endswith(f".{e.lower()}") for e in exts):
                 return False
 
     return True
 
-async def record_processed_history(uid_str, chat_link_context):
-    async with data_lock:
-        if uid_str not in PROCESSED_HISTORY:
-            PROCESSED_HISTORY[uid_str] = []
-        if chat_link_context not in PROCESSED_HISTORY[uid_str]:
-            PROCESSED_HISTORY[uid_str].append(chat_link_context)
-            await save_history()
 
-# --------------- Account Persistence Helpers ---------------
-async def get_user_client(uid, user_data):
+async def record_history(uid_str: str, context: str) -> None:
+    PROCESSED_HISTORY.setdefault(uid_str, [])
+    if context not in PROCESSED_HISTORY[uid_str]:
+        PROCESSED_HISTORY[uid_str].append(context)
+        await save_history()
+
+# ─────────────────────────────────────────────
+# User client pool
+# ─────────────────────────────────────────────
+async def get_user_client(uid: int, user_data: dict) -> Client:
     if uid in RUNNING_CLIENTS:
-        client = RUNNING_CLIENTS[uid]
-        if client.is_connected:
-            return client
+        c = RUNNING_CLIENTS[uid]
+        if c.is_connected:
+            return c
         try:
-            await client.start()
-            return client
+            await c.start()
+            return c
         except:
             RUNNING_CLIENTS.pop(uid, None)
-    client = Client(
+    c = Client(
         name=f"run_{uid}",
         api_id=user_data["api_id"],
         api_hash=user_data["api_hash"],
         session_string=user_data["session_string"],
-        in_memory=True
+        in_memory=True,
     )
-    await client.start()
-    RUNNING_CLIENTS[uid] = client
-    return client
+    await c.start()
+    RUNNING_CLIENTS[uid] = c
+    return c
 
-def get_readable_size(bytes_count):
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if bytes_count < 1024.0:
-            return f"{bytes_count:.2f} {unit}"
-        bytes_count /= 1024.0
-    return f"{bytes_count:.2f} PB"
+# ─────────────────────────────────────────────
+# Progress / size / time utilities
+# ─────────────────────────────────────────────
+def get_readable_size(b: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if b < 1024.0:
+            return f"{b:.2f} {unit}"
+        b /= 1024.0
+    return f"{b:.2f} PB"
 
-def get_readable_time(seconds):
-    if seconds < 60: return f"{int(seconds)}s"
-    minutes = seconds / 60
-    if minutes < 60: return f"{int(minutes)}m {int(seconds % 60)}s"
-    return f"{int(minutes // 60)}h {int(minutes % 60)}m"
 
-async def progress_cb(current, total, status_message, action_text, tracking_ctx, uid):
+def get_readable_time(s: float) -> str:
+    if s < 60:
+        return f"{int(s)}s"
+    m = s / 60
+    if m < 60:
+        return f"{int(m)}m {int(s % 60)}s"
+    return f"{int(m // 60)}h {int(m % 60)}m"
+
+
+async def progress_cb(current, total, status_msg, action_text, ctx, uid) -> None:
+    # FIX: raise DownloadCancelled, not StopIteration.
+    # StopIteration inside an async def is caught by the interpreter and
+    # re-raised as RuntimeError (PEP 479), causing an unhandled crash.
     if CANCEL_BATCH.get(uid, False):
         raise DownloadCancelled()
     if not total:
         return
     now = time.time()
-    if now - tracking_ctx.get("last_edit", 0.0) >= 3.5 or current == total:
-        tracking_ctx["last_edit"] = now
-        elapsed_time = max(now - tracking_ctx["start_time"], 0.01)
-        speed_bps    = current / elapsed_time
-        percent      = current * 100 / total
-        eta_seconds  = (total - current) / speed_bps if speed_bps > 0 else 0
-        filled       = int(20 * percent / 100)
-        bar          = f"[{'█' * filled}{'░' * (20 - filled)}] {percent:.1f}%"
-        panel = (
+    if now - ctx.get("last_edit", 0.0) >= 3.5 or current == total:
+        ctx["last_edit"] = now
+        # FIX: max() is semantically correct — "expr or 0.01" fails for tiny
+        # positive floats that are already truthy (no-op) but still very small.
+        elapsed = max(now - ctx["start_time"], 0.01)
+        speed   = current / elapsed
+        pct     = current * 100 / total
+        eta     = (total - current) / speed if speed > 0 else 0
+        filled  = int(20 * pct / 100)
+        bar     = f"[{'█' * filled}{'░' * (20 - filled)}] {pct:.1f}%"
+        panel   = (
             f"**{action_text}**\n\n"
             f"📊 {bar}\n"
             f"📁 **Size:** {get_readable_size(current)} / {get_readable_size(total)}\n"
-            f"⚡ **Speed:** {get_readable_size(speed_bps)}/s\n"
-            f"⏳ **ETA:** {get_readable_time(eta_seconds)}"
+            f"⚡ **Speed:** {get_readable_size(speed)}/s\n"
+            f"⏳ **ETA:** {get_readable_time(eta)}"
         )
-        try: await status_message.edit_text(panel)
-        except: pass
+        try:
+            await status_msg.edit_text(panel)
+        except:
+            pass
 
-# --------------- Base Commands ---------------
+# ─────────────────────────────────────────────
+# Commands
+# ─────────────────────────────────────────────
 @bot.on_message(filters.command(["start"]) & subscribed_only)
-async def start(bot: Client, m: Message):
+async def cmd_start(_bot: Client, m: Message) -> None:
     await m.reply_text(
         "**Welcome!**\n\n"
-        "Commands:\n"
-        "🔑 /login   — Link your Telegram account\n"
-        "🚪 /logout  — Unlink your account\n"
-        "📊 /status  — Check login & subscription info\n"
-        "⚙ /settings — Configure filters & output\n"
-        "❌ /cancel  — Abort ongoing tasks"
+        "🔑 /login    — Link your Telegram account\n"
+        "🚪 /logout   — Unlink your account\n"
+        "📊 /status   — Subscription & session info\n"
+        "⚙️ /settings — Configure filters & output\n"
+        "❌ /cancel   — Abort ongoing tasks"
     )
 
+
 @bot.on_message(filters.command(["login"]) & filters.private & subscribed_only)
-async def login_cmd(bot: Client, m: Message):
+async def cmd_login(_bot: Client, m: Message) -> None:
     str_uid = str(m.from_user.id)
+    # FIX: tell the user they're already logged in instead of silently overwriting
     if str_uid in USER_SESSIONS:
         await m.reply_text("✅ Already logged in. Use /logout to disconnect first.")
         return
     USER_STATES[str_uid] = "WAITING_API_ID"
-    await m.reply_text("🔑 Send your **API ID** (from my.telegram.org/apps):")
+    await m.reply_text(
+        "🔑 **Login Started**\n\n"
+        "Send your **API ID** (numeric, from my.telegram.org/apps):"
+    )
+
 
 @bot.on_message(filters.command(["logout"]) & filters.private & subscribed_only)
-async def logout_cmd(bot: Client, m: Message):
-    user_id = m.from_user.id
-    str_uid = str(user_id)
+async def cmd_logout(_bot: Client, m: Message) -> None:
+    uid     = m.from_user.id
+    str_uid = str(uid)
     if str_uid not in USER_SESSIONS:
-        await m.reply_text("❌ You are not logged in.")
+        await m.reply_text("❌ You are not currently logged in.")
         return
-    if user_id in RUNNING_CLIENTS:
-        try: await RUNNING_CLIENTS[user_id].stop()
+    if uid in RUNNING_CLIENTS:
+        try: await RUNNING_CLIENTS[uid].stop()
         except: pass
-        RUNNING_CLIENTS.pop(user_id, None)
-    async with data_lock:
-        USER_SESSIONS.pop(str_uid, None)
-        await save_sessions()
-    ACTIVE_LOGINS.pop(user_id, None)
+        RUNNING_CLIENTS.pop(uid, None)
+    USER_SESSIONS.pop(str_uid, None)
+    ACTIVE_LOGINS.pop(uid, None)
     USER_STATES.pop(str_uid, None)
-    await m.reply_text("✅ Logged out successfully.")
+    await save_sessions()
+    await m.reply_text("✅ Session removed successfully.")
+
 
 @bot.on_message(filters.command(["status"]) & filters.private & subscribed_only)
-async def status_cmd(bot: Client, m: Message):
-    user_id = m.from_user.id
-    str_uid = str(user_id)
-    logged_in = "✅ Logged In" if str_uid in USER_SESSIONS else "❌ Not Logged In"
-    if user_id == ADMIN_ID:
-        sub_str = "♾️ Admin (Unlimited)"
+async def cmd_status(_bot: Client, m: Message) -> None:
+    uid     = m.from_user.id
+    str_uid = str(uid)
+    # FIX: admin gets a proper unlimited label
+    if uid == ADMIN_ID:
+        sub_text = "♾️ Admin (Unlimited)"
+    elif str_uid in AUTHORIZED_USERS:
+        remaining = max(0.0, AUTHORIZED_USERS[str_uid] - time.time())
+        d = int(remaining // 86400)
+        h = int((remaining % 86400) // 3600)
+        sub_text = f"✅ Active — {d}d {h}h remaining"
     else:
-        expiry = AUTHORIZED_USERS.get(str_uid)
-        if expiry:
-            remaining = max(0, int(expiry - time.time()))
-            sub_str = f"✅ Active ({remaining // 3600}h {(remaining % 3600) // 60}m remaining)"
-        else:
-            sub_str = "❌ Not Authorized"
-    await m.reply_text(f"📊 **Account Status**\n\n👤 Account: {logged_in}\n🔐 Subscription: {sub_str}")
+        sub_text = "❌ Not authorized / Expired"
+    session_ok = "✅ Linked" if str_uid in USER_SESSIONS else "❌ Not linked"
+    await m.reply_text(
+        f"📊 **Account Status**\n\n"
+        f"🔹 Subscription: {sub_text}\n"
+        f"🔹 Session:       {session_ok}"
+    )
+
 
 @bot.on_message(filters.command(["settings"]) & filters.private & subscribed_only)
-async def open_settings(bot: Client, m: Message):
-    uid_str = str(m.from_user.id)
-    init_user_config(uid_str)
-    await m.reply_text("⚙️ **Main Custom Output Settings Panel**",
-                       reply_markup=get_main_settings_keyboard())
+async def cmd_settings(_bot: Client, m: Message) -> None:
+    init_user_config(str(m.from_user.id))
+    await m.reply_text(
+        "⚙️ **Main Custom Output Settings Panel**",
+        reply_markup=get_main_settings_keyboard()
+    )
+
 
 @bot.on_message(filters.command(["cancel"]) & subscribed_only)
-async def cancel_cmd(bot: Client, m: Message):
-    user_id = m.from_user.id if m.from_user else m.chat.id
-    USER_STATES.pop(str(user_id), None)
-    CANCEL_BATCH[user_id] = True
-    await m.reply_text("🛑 Sequences stopped.")
+async def cmd_cancel(_bot: Client, m: Message) -> None:
+    uid = m.from_user.id if m.from_user else m.chat.id
+    USER_STATES.pop(str(uid), None)
+    CANCEL_BATCH[uid] = True
+    await m.reply_text("🛑 All sequences stopped.")
 
-# --------------- Conversation & Extraction Engine ---------------
+# ─────────────────────────────────────────────
+# Conversation FSM + link dispatcher
+# ─────────────────────────────────────────────
 @bot.on_message((filters.text | filters.caption | filters.photo) & subscribed_only)
-async def handle_text_inputs(client: Client, message: Message):
-    user_id = message.from_user.id if message.from_user else message.chat.id
-    str_uid = str(user_id)
+async def handle_text_inputs(client: Client, message: Message) -> None:
+    uid     = message.from_user.id if message.from_user else message.chat.id
+    str_uid = str(uid)
     text    = (message.text or message.caption or "").strip()
 
+    # Don't let the text handler swallow command messages
     if text.startswith("/"):
         cmd = text.split()[0].split("@")[0]
-        if cmd in ["/start", "/login", "/logout", "/cancel",
-                   "/adduser", "/remuser", "/status", "/settings"]:
+        if cmd in ("/start", "/login", "/logout", "/cancel",
+                   "/adduser", "/remuser", "/status", "/settings"):
             return
 
+    # ── State machine (private chat only) ───────────────────────────────────
     if str_uid in USER_STATES and message.chat.type == pyrogram.enums.ChatType.PRIVATE:
         state  = USER_STATES[str_uid]
         config = init_user_config(str_uid)
 
+        # Settings states ────────────────────────────────────────────────────
         if state == "SETTING_CAPTION":
             if text:
                 config["caption"]     = text
                 config["use_caption"] = True
                 await save_user_settings()
                 USER_STATES.pop(str_uid, None)
-                await message.reply_text("✅ Custom caption saved.")
+                await message.reply_text("✅ Caption saved.")
             return
 
         elif state == "SETTING_THUMBNAIL":
             if message.photo:
-                config["thumb"]     = message.photo.file_id
+                config["thumb"]    = message.photo.file_id
                 config["use_thumb"] = True
                 await save_user_settings()
                 USER_STATES.pop(str_uid, None)
                 await message.reply_text("✅ Thumbnail saved.")
             else:
-                await message.reply_text("⚠️ Please send a photo image for the thumbnail.")
+                await message.reply_text("⚠️ Please send a photo image.")
             return
 
         elif state == "SETTING_SIZE_LIMIT":
@@ -572,370 +690,434 @@ async def handle_text_inputs(client: Client, message: Message):
                 config["filters"]["size_limit"] = size
                 await save_user_settings()
                 USER_STATES.pop(str_uid, None)
-                label = "unlimited" if size == 0 else f"{size}MB max"
-                await message.reply_text(f"✅ Size limit set to `{label}`.")
+                label = "unlimited" if size == 0 else f"{size} MB"
+                await message.reply_text(f"✅ Size limit set: `{label}`.")
             except ValueError:
-                await message.reply_text("❌ Invalid. Please send a non-negative whole number (e.g. `50`).")
+                await message.reply_text("❌ Please send a non-negative number (e.g. `50`).")
             return
 
         elif state == "SETTING_EXTENSIONS":
             if text.lower() == "clear":
                 config["filters"]["extensions"] = []
-                await save_user_settings()
-                USER_STATES.pop(str_uid, None)
-                await message.reply_text("✅ Extension filter cleared.")
             else:
-                exts = [e.strip().lower().lstrip(".") for e in text.split() if e.strip()]
-                config["filters"]["extensions"] = exts
-                await save_user_settings()
-                USER_STATES.pop(str_uid, None)
-                await message.reply_text(f"✅ Extensions saved: `{', '.join(exts)}`.")
+                config["filters"]["extensions"] = [
+                    e.strip().lower().lstrip(".") for e in text.split() if e.strip()
+                ]
+            await save_user_settings()
+            USER_STATES.pop(str_uid, None)
+            await message.reply_text("✅ Extensions updated.")
             return
 
         elif state == "SETTING_KEYWORDS":
             if text.lower() == "clear":
                 config["filters"]["keywords"] = []
-                await save_user_settings()
-                USER_STATES.pop(str_uid, None)
-                await message.reply_text("✅ Keywords cleared.")
             else:
-                kws = [kw.strip() for kw in text.split(",") if kw.strip()]
-                config["filters"]["keywords"] = kws
-                await save_user_settings()
-                USER_STATES.pop(str_uid, None)
-                await message.reply_text(f"✅ Keywords saved: `{', '.join(kws)}`.")
+                config["filters"]["keywords"] = [
+                    k.strip() for k in text.split(",") if k.strip()
+                ]
+            await save_user_settings()
+            USER_STATES.pop(str_uid, None)
+            await message.reply_text("✅ Keywords updated.")
             return
 
-        # Login states
+        # Login states ───────────────────────────────────────────────────────
         if state == "WAITING_API_ID":
             if not text.isdigit():
                 await message.reply_text("❌ API ID must be a number. Try again:")
                 return
-            ACTIVE_LOGINS[user_id] = {"api_id": int(text)}
-            USER_STATES[str_uid]   = "WAITING_API_HASH"
+            ACTIVE_LOGINS[uid] = {"api_id": int(text)}
+            USER_STATES[str_uid] = "WAITING_API_HASH"
             await message.reply_text("⚙️ Send your **API HASH**:")
             return
 
         elif state == "WAITING_API_HASH":
-            if user_id not in ACTIVE_LOGINS:
+            # FIX: guard against bot restart mid-login flow (ACTIVE_LOGINS is lost)
+            if uid not in ACTIVE_LOGINS:
                 USER_STATES.pop(str_uid, None)
-                await message.reply_text("❌ Session expired. Please use /login again.")
+                await message.reply_text("❌ Session expired. Use /login to start over.")
                 return
-            ACTIVE_LOGINS[user_id]["api_hash"] = text
+            ACTIVE_LOGINS[uid]["api_hash"] = text
             USER_STATES[str_uid] = "WAITING_PHONE"
             await message.reply_text("📱 Send your **Phone Number** (with country code, e.g. +12345678900):")
             return
 
         elif state == "WAITING_PHONE":
-            if user_id not in ACTIVE_LOGINS:
+            if uid not in ACTIVE_LOGINS:
                 USER_STATES.pop(str_uid, None)
-                await message.reply_text("❌ Session expired. Please use /login again.")
+                await message.reply_text("❌ Session expired. Use /login to start over.")
                 return
-            ACTIVE_LOGINS[user_id]["phone"] = text
+            ACTIVE_LOGINS[uid]["phone"] = text
             temp_client = None
             try:
                 temp_client = Client(
-                    name=f"login_{user_id}",
-                    api_id=ACTIVE_LOGINS[user_id]["api_id"],
-                    api_hash=ACTIVE_LOGINS[user_id]["api_hash"],
-                    in_memory=True
+                    name=f"login_{uid}",
+                    api_id=ACTIVE_LOGINS[uid]["api_id"],
+                    api_hash=ACTIVE_LOGINS[uid]["api_hash"],
+                    in_memory=True,
                 )
                 await temp_client.connect()
                 code_info = await temp_client.send_code(text)
-                ACTIVE_LOGINS[user_id]["client"]          = temp_client
-                ACTIVE_LOGINS[user_id]["phone_code_hash"] = code_info.phone_code_hash
+                ACTIVE_LOGINS[uid]["client"]          = temp_client
+                ACTIVE_LOGINS[uid]["phone_code_hash"] = code_info.phone_code_hash
                 USER_STATES[str_uid] = "WAITING_OTP"
-                await message.reply_text("📩 Send the **OTP Code** (spaces are fine):")
-            except Exception as e:
+                await message.reply_text("📩 Send the **OTP code** (spaces are fine):")
+            except Exception as exc:
+                # FIX: always disconnect the temp_client to prevent a resource leak
                 if temp_client:
                     try: await temp_client.disconnect()
                     except: pass
-                ACTIVE_LOGINS.pop(user_id, None)
+                ACTIVE_LOGINS.pop(uid, None)
                 USER_STATES.pop(str_uid, None)
-                await message.reply_text(f"❌ Connection error: `{e}`")
+                await message.reply_text(f"❌ Connection error: `{exc}`")
             return
 
         elif state == "WAITING_OTP":
-            login_data = ACTIVE_LOGINS.get(user_id)
+            login_data = ACTIVE_LOGINS.get(uid)
             if not login_data:
                 USER_STATES.pop(str_uid, None)
-                await message.reply_text("❌ Session expired. Please use /login again.")
+                await message.reply_text("❌ Session expired. Use /login to start over.")
                 return
             try:
                 await login_data["client"].sign_in(
                     phone_number=login_data["phone"],
                     phone_code_hash=login_data["phone_code_hash"],
-                    phone_code=text.replace(" ", "")
+                    phone_code=text.replace(" ", ""),
                 )
                 session_str = await login_data["client"].export_session_string()
-                async with data_lock:
-                    USER_SESSIONS[str_uid] = {
-                        "api_id":         login_data["api_id"],
-                        "api_hash":       login_data["api_hash"],
-                        "session_string": session_str
-                    }
-                    await save_sessions()
+                USER_SESSIONS[str_uid] = {
+                    "api_id":         login_data["api_id"],
+                    "api_hash":       login_data["api_hash"],
+                    "session_string": session_str,
+                }
+                await save_sessions()
                 USER_STATES.pop(str_uid, None)
-                ACTIVE_LOGINS.pop(user_id, None)
+                ACTIVE_LOGINS.pop(uid, None)   # FIX: clean up after success
                 await message.reply_text("🎉 **Login Successful!**")
             except SessionPasswordNeeded:
                 USER_STATES[str_uid] = "WAITING_2FA"
                 await message.reply_text("🔐 Enter your **2FA Password**:")
-            except (PhoneCodeInvalid, PhoneCodeExpired) as e:
+            except (PhoneCodeInvalid, PhoneCodeExpired) as exc:
                 USER_STATES.pop(str_uid, None)
-                ACTIVE_LOGINS.pop(user_id, None)
-                await message.reply_text(f"❌ Invalid/Expired OTP: `{e}`\nPlease use /login to try again.")
-            except Exception as e:
-                await message.reply_text(f"❌ Error: `{e}`")
+                ACTIVE_LOGINS.pop(uid, None)
+                await message.reply_text(
+                    f"❌ Invalid / expired OTP: `{exc}`\nUse /login to try again."
+                )
+            except Exception as exc:
+                await message.reply_text(f"❌ Error: `{exc}`")
             return
 
         elif state == "WAITING_2FA":
-            login_data = ACTIVE_LOGINS.get(user_id)
+            login_data = ACTIVE_LOGINS.get(uid)
             if not login_data:
                 USER_STATES.pop(str_uid, None)
-                await message.reply_text("❌ Session expired. Please use /login again.")
+                await message.reply_text("❌ Session expired. Use /login to start over.")
                 return
             try:
                 await login_data["client"].check_password(password=text)
                 session_str = await login_data["client"].export_session_string()
-                async with data_lock:
-                    USER_SESSIONS[str_uid] = {
-                        "api_id":         login_data["api_id"],
-                        "api_hash":       login_data["api_hash"],
-                        "session_string": session_str
-                    }
-                    await save_sessions()
+                USER_SESSIONS[str_uid] = {
+                    "api_id":         login_data["api_id"],
+                    "api_hash":       login_data["api_hash"],
+                    "session_string": session_str,
+                }
+                await save_sessions()
                 USER_STATES.pop(str_uid, None)
-                ACTIVE_LOGINS.pop(user_id, None)
+                ACTIVE_LOGINS.pop(uid, None)   # FIX: clean up after success
                 await message.reply_text("🎉 **2FA Login Successful!**")
-            except Exception as e:
-                await message.reply_text(f"❌ Error: `{e}`")
+            except Exception as exc:
+                await message.reply_text(f"❌ Error: `{exc}`")
             return
 
     if not text:
         return
 
-    # Batch Processors
+    # ── Invite link handler ──────────────────────────────────────────────────
     if "https://t.me/+" in text or "https://t.me/joinchat/" in text:
         if str_uid not in USER_SESSIONS:
             return
         try:
-            user_acc = await get_user_client(user_id, USER_SESSIONS[str_uid])
-            await user_acc.join_chat(text)
-            await bot.send_message(message.chat.id, "✅ Joined chat.", reply_to_message_id=message.id)
-        except Exception as e:
-            await bot.send_message(message.chat.id, f"❌ Join Failed: `{e}`")
+            acc = await get_user_client(uid, USER_SESSIONS[str_uid])
+            await acc.join_chat(text)
+            await bot.send_message(message.chat.id, "✅ Joined chat.",
+                                   reply_to_message_id=message.id)
+        except Exception as exc:
+            await bot.send_message(message.chat.id, f"❌ Join failed: `{exc}`")
         return
 
-    CANCEL_BATCH[user_id] = False
+    # FIX: Reset cancellation flag HERE (before the loop), NOT inside
+    # process_single_link.  Resetting inside the function un-cancels every
+    # subsequent link in a multi-link batch, making /cancel ineffective.
+    CANCEL_BATCH[uid] = False
+
+    # Range shorthand: https://t.me/chan/10 - 20
     range_match = re.match(
-        r'(https://t\.me/(?:c/)?[^/\s]+)(?:/\d+)?/(\d+)\s*-\s*(\d+)$', text
+        r"(https://t\.me/(?:c/)?[^/\s]+)(?:/\d+)?/(\d+)\s*-\s*(\d+)$", text
     )
     if range_match:
-        base_link = range_match.group(1)
-        start_id  = int(range_match.group(2))
-        end_id    = int(range_match.group(3))
-        if end_id < start_id:
+        base  = range_match.group(1)
+        start = int(range_match.group(2))
+        end   = int(range_match.group(3))
+        if end < start:
             return
-        for msg_id in range(start_id, end_id + 1):
-            if CANCEL_BATCH.get(user_id, False):
+        for msg_id in range(start, end + 1):
+            if CANCEL_BATCH.get(uid, False):
                 break
-            await process_single_link(f"{base_link}/{msg_id}", message, uid=user_id)
+            await process_single_link(f"{base}/{msg_id}", message, uid=uid)
             await asyncio.sleep(2)
         return
 
-    links = re.findall(r'https://t\.me/(?:c/)?[^/\s]+(?:\/\d+)?/\d+', text)
+    # Individual links (one or more per message)
+    links = re.findall(r"https://t\.me/(?:c/)?[^/\s]+(?:\/\d+)?/\d+", text)
     for link in links:
-        if CANCEL_BATCH.get(user_id, False):
+        if CANCEL_BATCH.get(uid, False):
             break
-        await process_single_link(link, message, uid=user_id)
+        await process_single_link(link, message, uid=uid)
         await asyncio.sleep(2)
 
-# --------------- FloodWait Resilient Engine Loop ---------------
-async def process_single_link(link, original_msg, uid=0):
-    CANCEL_BATCH[uid] = False
-
-    datas       = link.split("/")
-    msgid       = int(datas[-1])
+# ─────────────────────────────────────────────
+# Core extraction loop (FloodWait-resilient)
+# ─────────────────────────────────────────────
+async def process_single_link(link: str, original_msg: Message, uid: int = 0) -> None:
+    parts       = link.split("/")
+    msgid       = int(parts[-1])
     str_uid     = str(uid)
-    user_config = init_user_config(str_uid)
-    filter_rules = user_config["filters"]
+    user_cfg    = init_user_config(str_uid)
+    frules      = user_cfg["filters"]
 
-    async def reply(text):
-        return await bot.send_message(original_msg.chat.id, text,
-                                      reply_to_message_id=original_msg.id)
+    async def reply(txt: str):
+        return await bot.send_message(
+            original_msg.chat.id, txt, reply_to_message_id=original_msg.id
+        )
 
     while True:
         if CANCEL_BATCH.get(uid, False):
             await reply("🛑 Extraction cancelled.")
             return
 
-        file = thumb = status_msg = None
+        # All temp file handles initialised to None so finally can always clean up
+        file = thumb = pub_thumb = status_msg = None
 
         try:
-            # ---- Private channel (t.me/c/...) ----
+            # ── Private channel (t.me/c/…) ───────────────────────────────────
             if "https://t.me/c/" in link:
                 if str_uid not in USER_SESSIONS:
                     return
-                chatid   = int("-100" + datas[4])
+                chatid   = int("-100" + parts[4])
                 user_acc = await get_user_client(uid, USER_SESSIONS[str_uid])
-                msg = await user_acc.get_messages(chatid, msgid)
+                msg      = await user_acc.get_messages(chatid, msgid)
                 if not msg:
                     break
                 if not passed_content_filters(str_uid, msg, f"{chatid}_{msgid}"):
                     break
 
-                if filter_rules.get("forward_tag", False):
+                if frules.get("forward_tag", False):
                     try:
                         await user_acc.forward_messages(original_msg.chat.id, chatid, msgid)
-                        await record_processed_history(str_uid, f"{chatid}_{msgid}")
+                        await record_history(str_uid, f"{chatid}_{msgid}")
                         break
-                    except FloodWait as e:
-                        raise e
+                    except FloodWait as exc:
+                        raise exc
                     except:
-                        pass
+                        pass   # fall through to download path
 
-                has_media = any([msg.document, msg.video, msg.animation, msg.sticker,
-                                 msg.voice, msg.audio, msg.photo])
-                final_caption  = user_config["caption"] if user_config["use_caption"] else (msg.caption or "")
-                final_entities = None if user_config["use_caption"] else (msg.caption_entities or msg.entities)
+                has_media      = any([msg.document, msg.video, msg.animation,
+                                      msg.sticker, msg.voice, msg.audio, msg.photo])
+                final_cap      = user_cfg["caption"] if user_cfg["use_caption"] else (msg.caption or "")
+                final_entities = None if user_cfg["use_caption"] else (msg.caption_entities or msg.entities)
 
                 if not has_media:
-                    text_to_send = user_config["caption"] if user_config["use_caption"] else (msg.text or msg.caption)
-                    if text_to_send:
-                        await bot.send_message(original_msg.chat.id, text_to_send,
-                                               entities=final_entities,
-                                               reply_to_message_id=original_msg.id)
-                        await record_processed_history(str_uid, f"{chatid}_{msgid}")
+                    txt_out = user_cfg["caption"] if user_cfg["use_caption"] else (msg.text or msg.caption)
+                    if txt_out:
+                        await bot.send_message(
+                            original_msg.chat.id, txt_out,
+                            entities=final_entities,
+                            reply_to_message_id=original_msg.id,
+                        )
+                        await record_history(str_uid, f"{chatid}_{msgid}")
                     break
 
-                status_msg   = await reply("📥 Fetching encrypted storage payloads...")
-                download_ctx = {"start_time": time.time(), "last_edit": 0.0}
-                upload_ctx   = {"start_time": time.time(), "last_edit": 0.0}
+                status_msg = await reply("📥 Fetching content…")
+                dl_ctx = {"start_time": time.time(), "last_edit": 0.0}
+                up_ctx = {"start_time": time.time(), "last_edit": 0.0}
 
                 file = await user_acc.download_media(
                     msg, progress=progress_cb,
-                    progress_args=(status_msg, "📥 Processing Download", download_ctx, uid)
+                    progress_args=(status_msg, "📥 Downloading", dl_ctx, uid),
                 )
 
-                if user_config["use_thumb"] and user_config["thumb"]:
-                    try: thumb = await bot.download_media(user_config["thumb"])
+                # Smart thumbnail: custom first, then fallback to message's own thumb
+                if user_cfg["use_thumb"] and user_cfg["thumb"]:
+                    try: thumb = await bot.download_media(user_cfg["thumb"])
                     except: pass
+                else:
+                    holder = msg.document or msg.video
+                    if holder and getattr(holder, "thumbs", None):
+                        try: thumb = await user_acc.download_media(holder.thumbs[0].file_id)
+                        except: pass
 
                 if msg.document:
                     await bot.send_document(
                         original_msg.chat.id, file, thumb=thumb,
-                        caption=final_caption, caption_entities=final_entities,
+                        caption=final_cap, caption_entities=final_entities,
                         reply_to_message_id=original_msg.id,
                         progress=progress_cb,
-                        progress_args=(status_msg, "📤 Uploading Document", upload_ctx, uid)
+                        progress_args=(status_msg, "📤 Uploading Document", up_ctx, uid),
                     )
                 elif msg.video:
                     await bot.send_video(
                         original_msg.chat.id, file,
-                        duration=msg.video.duration, width=msg.video.width, height=msg.video.height,
-                        thumb=thumb, caption=final_caption, caption_entities=final_entities,
+                        duration=msg.video.duration,
+                        width=msg.video.width, height=msg.video.height,
+                        thumb=thumb, caption=final_cap,
+                        caption_entities=final_entities,
                         reply_to_message_id=original_msg.id,
                         progress=progress_cb,
-                        progress_args=(status_msg, "📤 Uploading Video", upload_ctx, uid)
+                        progress_args=(status_msg, "📤 Uploading Video", up_ctx, uid),
+                    )
+                elif msg.photo:
+                    await bot.send_photo(
+                        original_msg.chat.id, file,
+                        caption=final_cap, caption_entities=final_entities,
+                        reply_to_message_id=original_msg.id,
                     )
                 elif msg.audio:
                     await bot.send_audio(
                         original_msg.chat.id, file,
-                        caption=final_caption, caption_entities=final_entities,
-                        reply_to_message_id=original_msg.id
+                        caption=final_cap, caption_entities=final_entities,
+                        reply_to_message_id=original_msg.id,
                     )
                 elif msg.voice:
                     await bot.send_voice(
                         original_msg.chat.id, file,
-                        caption=final_caption, caption_entities=final_entities,
-                        reply_to_message_id=original_msg.id
+                        caption=final_cap, caption_entities=final_entities,
+                        reply_to_message_id=original_msg.id,
                     )
                 elif msg.animation:
                     await bot.send_animation(
                         original_msg.chat.id, file,
-                        caption=final_caption, caption_entities=final_entities,
-                        reply_to_message_id=original_msg.id
+                        caption=final_cap, caption_entities=final_entities,
+                        reply_to_message_id=original_msg.id,
                     )
                 elif msg.sticker:
-                    await bot.send_sticker(original_msg.chat.id, file,
-                                           reply_to_message_id=original_msg.id)
-                elif msg.photo:
-                    await bot.send_photo(
+                    await bot.send_sticker(
                         original_msg.chat.id, file,
-                        caption=final_caption, caption_entities=final_entities,
-                        reply_to_message_id=original_msg.id
+                        reply_to_message_id=original_msg.id,
                     )
 
-                await record_processed_history(str_uid, f"{chatid}_{msgid}")
+                await record_history(str_uid, f"{chatid}_{msgid}")
                 break
 
-            # ---- Public channel (t.me/username/...) ----
+            # ── Public channel (t.me/username/…) ─────────────────────────────
             else:
-                username = datas[-2]
-                msg = await bot.get_messages(username, msgid)
+                username = parts[-2]
+                msg      = await bot.get_messages(username, msgid)
                 if not msg:
                     break
                 if not passed_content_filters(str_uid, msg, f"{username}_{msgid}"):
                     break
 
-                if filter_rules.get("forward_tag", False):
+                if frules.get("forward_tag", False):
                     await bot.forward_messages(original_msg.chat.id, username, msgid)
-                    await record_processed_history(str_uid, f"{username}_{msgid}")
+                    await record_history(str_uid, f"{username}_{msgid}")
                     break
 
-                final_caption  = user_config["caption"] if user_config["use_caption"] else (msg.caption or "")
-                final_entities = None if user_config["use_caption"] else (msg.caption_entities or msg.entities)
+                final_cap      = user_cfg["caption"] if user_cfg["use_caption"] else (msg.caption or "")
+                final_entities = None if user_cfg["use_caption"] else (msg.caption_entities or msg.entities)
+
+                # If a custom thumbnail is set we must download+re-upload to apply it
+                if user_cfg["use_thumb"] and user_cfg["thumb"]:
+                    try: pub_thumb = await bot.download_media(user_cfg["thumb"])
+                    except: pass
 
                 if msg.document:
-                    await bot.send_document(original_msg.chat.id, msg.document.file_id,
-                                            caption=final_caption, caption_entities=final_entities,
-                                            reply_to_message_id=original_msg.id)
+                    if pub_thumb:
+                        file = await bot.download_media(msg)
+                        await bot.send_document(
+                            original_msg.chat.id, file, thumb=pub_thumb,
+                            caption=final_cap, caption_entities=final_entities,
+                            reply_to_message_id=original_msg.id,
+                        )
+                    else:
+                        await bot.send_document(
+                            original_msg.chat.id, msg.document.file_id,
+                            caption=final_cap, caption_entities=final_entities,
+                            reply_to_message_id=original_msg.id,
+                        )
                 elif msg.video:
-                    await bot.send_video(original_msg.chat.id, msg.video.file_id,
-                                         caption=final_caption, caption_entities=final_entities,
-                                         reply_to_message_id=original_msg.id)
-                elif msg.audio:
-                    await bot.send_audio(original_msg.chat.id, msg.audio.file_id,
-                                         caption=final_caption, caption_entities=final_entities,
-                                         reply_to_message_id=original_msg.id)
-                elif msg.voice:
-                    await bot.send_voice(original_msg.chat.id, msg.voice.file_id,
-                                         caption=final_caption, caption_entities=final_entities,
-                                         reply_to_message_id=original_msg.id)
-                elif msg.animation:
-                    await bot.send_animation(original_msg.chat.id, msg.animation.file_id,
-                                             caption=final_caption, caption_entities=final_entities,
-                                             reply_to_message_id=original_msg.id)
-                elif msg.sticker:
-                    await bot.send_sticker(original_msg.chat.id, msg.sticker.file_id,
-                                           reply_to_message_id=original_msg.id)
+                    if pub_thumb:
+                        file = await bot.download_media(msg)
+                        await bot.send_video(
+                            original_msg.chat.id, file, thumb=pub_thumb,
+                            caption=final_cap, caption_entities=final_entities,
+                            reply_to_message_id=original_msg.id,
+                        )
+                    else:
+                        await bot.send_video(
+                            original_msg.chat.id, msg.video.file_id,
+                            caption=final_cap, caption_entities=final_entities,
+                            reply_to_message_id=original_msg.id,
+                        )
                 elif msg.photo:
-                    await bot.send_photo(original_msg.chat.id, msg.photo.file_id,
-                                         caption=final_caption, caption_entities=final_entities,
-                                         reply_to_message_id=original_msg.id)
+                    await bot.send_photo(
+                        original_msg.chat.id, msg.photo.file_id,
+                        caption=final_cap, caption_entities=final_entities,
+                        reply_to_message_id=original_msg.id,
+                    )
+                elif msg.audio:
+                    await bot.send_audio(
+                        original_msg.chat.id, msg.audio.file_id,
+                        caption=final_cap, caption_entities=final_entities,
+                        reply_to_message_id=original_msg.id,
+                    )
+                elif msg.voice:
+                    await bot.send_voice(
+                        original_msg.chat.id, msg.voice.file_id,
+                        caption=final_cap,
+                        reply_to_message_id=original_msg.id,
+                    )
+                elif msg.animation:
+                    await bot.send_animation(
+                        original_msg.chat.id, msg.animation.file_id,
+                        caption=final_cap, caption_entities=final_entities,
+                        reply_to_message_id=original_msg.id,
+                    )
+                elif msg.sticker:
+                    await bot.send_sticker(
+                        original_msg.chat.id, msg.sticker.file_id,
+                        reply_to_message_id=original_msg.id,
+                    )
                 elif msg.text:
-                    send_text = user_config["caption"] if user_config["use_caption"] else msg.text
-                    await bot.send_message(original_msg.chat.id, send_text,
-                                           entities=final_entities,
-                                           reply_to_message_id=original_msg.id)
+                    send_text = user_cfg["caption"] if user_cfg["use_caption"] else msg.text
+                    await bot.send_message(
+                        original_msg.chat.id, send_text,
+                        entities=final_entities,
+                        reply_to_message_id=original_msg.id,
+                    )
 
-                await record_processed_history(str_uid, f"{username}_{msgid}")
+                await record_history(str_uid, f"{username}_{msgid}")
                 break
 
         except DownloadCancelled:
+            # FIX: our custom exception is caught cleanly here
             await reply("🛑 Download cancelled.")
             break
-        except FloodWait as e:
-            sleep_time = e.value + 2
-            await reply(f"⏳ **Rate Limit (FloodWait)**\nPausing `{sleep_time}s` then retrying...")
+
+        except FloodWait as exc:
+            sleep_time = exc.value + 2
+            await reply(
+                f"⏳ **Rate Limit (FloodWait)**\n"
+                f"Pausing `{sleep_time}s` then retrying…"
+            )
             await asyncio.sleep(sleep_time)
-            continue
-        except Exception as e:
-            await reply(f"⚠️ Extraction Error: `{e}`")
+            continue   # retry the same message
+
+        except Exception as exc:
+            await reply(f"⚠️ Extraction error: `{exc}`")
             break
+
         finally:
-            for f in (file, thumb):
+            # Clean up every temp file regardless of which route ran
+            for f in (file, thumb, pub_thumb):
                 if f and os.path.exists(f):
                     try: os.remove(f)
                     except: pass
@@ -943,6 +1125,15 @@ async def process_single_link(link, original_msg, uid=0):
                 try: await status_msg.delete()
                 except: pass
 
-# --------------- Start Execution ---------------
+# ─────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────
+async def main() -> None:
+    await load_data()
+    await bot.start()
+    print("✅ Bot is running…")
+    await asyncio.Event().wait()   # block forever
+
+
 if __name__ == "__main__":
-    bot.run()
+    asyncio.run(main())
